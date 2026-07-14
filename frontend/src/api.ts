@@ -25,7 +25,7 @@ function errorMessage(data: unknown): string {
             venue: "Площадка", address: "Адрес", price: "Стоимость",
             male_capacity: "Мест для мужчин", female_capacity: "Мест для девушек",
             age_min: "Возраст от", age_max: "Возраст до", name: "Имя", phone: "Номер телефона",
-            birth_date: "Дата рождения",
+            birth_date: "Дата рождения", email: "Email", telegram: "Telegram",
           };
           const label = labels[field] || "Поле";
           const raw = String(error.msg).replace(/^Value error,\s*/, "");
@@ -82,7 +82,7 @@ export const api = {
       body: JSON.stringify({ phone, code }),
     }),
   me: () => request<User>("/me"),
-  updateMe: (data: Partial<User>) =>
+  updateMe: (data: ProfileUpdate) =>
     request<User>("/me", { method: "PUT", body: JSON.stringify(data) }),
   uploadPhoto: (file: File) => {
     const form = new FormData();
@@ -95,7 +95,10 @@ export const api = {
   events: () => request<Event[]>("/events"),
   event: (id: number) => request<Event>(`/events/${id}`),
   register: (id: number) =>
-    request(`/events/${id}/register`, {
+    request<{
+      registered: boolean;
+      notification: { title: string; body: string };
+    }>(`/events/${id}/register`, {
       method: "POST",
       body: JSON.stringify({
         personal_data_consent: true,
@@ -114,6 +117,10 @@ export const api = {
       body: JSON.stringify({ answers }),
     }),
   notifications: () => request<Notice[]>("/notifications"),
+  unreadNotifications: () =>
+    request<{ unread: number }>("/notifications/unread-count"),
+  readAllNotifications: () =>
+    request<{ read: boolean }>("/notifications/read-all", { method: "POST" }),
   createEvent: (data: unknown) =>
     request<{ id: number }>("/admin/events", {
       method: "POST",
@@ -148,6 +155,7 @@ export type Gender = "male" | "female";
 export type User = {
   id: number;
   phone: string;
+  email?: string;
   name?: string;
   gender?: Gender;
   birth_date?: string;
@@ -158,6 +166,16 @@ export type User = {
   whatsapp?: string;
   max_phone?: string;
   is_admin: boolean;
+};
+export type ProfileUpdate = {
+  name: string;
+  gender: Gender;
+  birth_date: string;
+  email?: string;
+  bio?: string;
+  telegram: string;
+  whatsapp?: string;
+  max_phone?: string;
 };
 export type Registration = {
   id: number;

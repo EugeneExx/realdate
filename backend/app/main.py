@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -21,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, and_, delete, func, inspect as sa_inspect, select, text, update
+from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, and_, delete, func, inspect as sa_inspect, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 
@@ -100,6 +101,7 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     phone: Mapped[str] = mapped_column(String(24), unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(254), nullable=True)
     name: Mapped[str | None] = mapped_column(String(80))
     gender: Mapped[Gender | None] = mapped_column(SAEnum(Gender))
     birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -273,11 +275,14 @@ class VerifyIn(PhoneIn):
 
 
 class ProfileIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=2, max_length=80)
     gender: Gender
     birth_date: date
+    email: str | None = Field(default=None, max_length=254)
     bio: str = Field(default="", max_length=1200)
-    telegram: str | None = None
+    telegram: str = Field(min_length=1, max_length=100)
     whatsapp: str | None = None
     max_phone: str | None = None
 
@@ -289,7 +294,30 @@ class ProfileIn(BaseModel):
             raise ValueError("Имя должно содержать не менее 2 символов")
         return value
 
-    @field_validator("bio", "telegram", "whatsapp", "max_phone")
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+            raise ValueError("Введите корректный email")
+        return value
+
+    @field_validator("telegram")
+    @classmethod
+    def clean_telegram(cls, value: str) -> str:
+        username = re.sub(
+            r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/",
+            "",
+            value.strip(),
+            flags=re.IGNORECASE,
+        ).lstrip("@").split("/", 1)[0].split("?", 1)[0]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
+            raise ValueError("Введите корректное имя Telegram, например @username")
+        return f"@{username}"
+
+    @field_validator("bio", "whatsapp", "max_phone")
     @classmethod
     def clean_optional_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -416,10 +444,12 @@ async def admin_user(user: User = Depends(current_user)) -> User:
     return user
 
 
-def user_json(user: User, contacts: bool = True) -> dict:
+def user_json(user: User, contacts: bool = True, private: bool = False) -> dict:
     data = {"id": user.id, "phone": user.phone if contacts else None, "name": user.name, "gender": user.gender, "birth_date": user.birth_date, "age": calculate_age(user.birth_date) if user.birth_date else None, "bio": user.bio, "photo_url": user.photo_url, "is_admin": user.is_admin}
     if contacts:
         data.update(telegram=user.telegram, whatsapp=user.whatsapp, max_phone=user.max_phone)
+    if private:
+        data["email"] = user.email
     return data
 
 
@@ -457,6 +487,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 FIELD_NAMES = {
     "phone": "Номер телефона", "code": "Код", "name": "Имя", "gender": "Пол", "birth_date": "Дата рождения",
+    "email": "Email", "telegram": "Telegram",
     "bio": "Описание профиля", "title": "Название", "description": "Описание",
     "starts_at": "Дата и время", "venue": "Площадка", "address": "Адрес",
     "price": "Стоимость", "male_capacity": "Мест для мужчин",
@@ -482,6 +513,7 @@ async def validation_error_handler(_, exc: RequestValidationError):
         "decimal_parsing": f"Введите число в поле «{label}»",
         "datetime_from_date_parsing": f"Укажите корректные дату и время в поле «{label}»",
         "enum": f"Выберите допустимое значение в поле «{label}»",
+        "extra_forbidden": f"Поле «{label}» нельзя изменять",
     }
     if error_type == "value_error":
         message = str(error.get("msg", "Некорректное значение")).replace("Value error, ", "")
@@ -500,6 +532,8 @@ def migrate_schema(sync_conn):
     user_columns = {column["name"] for column in inspector.get_columns("users")}
     if "birth_date" not in user_columns:
         sync_conn.execute(text("ALTER TABLE users ADD COLUMN birth_date DATE"))
+    if "email" not in user_columns:
+        sync_conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(254)"))
     otp_columns = {column["name"] for column in inspector.get_columns("otp_codes")}
     if "created_at" not in otp_columns:
         sync_conn.execute(text("ALTER TABLE otp_codes ADD COLUMN created_at TIMESTAMP"))
@@ -639,20 +673,22 @@ async def verify(payload: VerifyIn, db: AsyncSession = Depends(get_db)):
         user.is_admin = True
     await db.commit()
     await db.refresh(user)
-    return {"access_token": token_for(user), "user": user_json(user)}
+    return {"access_token": token_for(user), "user": user_json(user, private=True)}
 
 
 @app.get("/api/me")
 async def me(user: User = Depends(current_user)):
-    return user_json(user)
+    return user_json(user, private=True)
 
 
 @app.put("/api/me")
 async def update_me(payload: ProfileIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    if not user.photo_url:
+        raise HTTPException(400, "Загрузите фотографию профиля")
     for key, value in payload.model_dump().items():
         setattr(user, key, value)
     await db.commit()
-    return user_json(user)
+    return user_json(user, private=True)
 
 
 @app.post("/api/me/photo")
@@ -701,8 +737,17 @@ async def event_detail(event_id: int, user: User = Depends(current_user), db: As
 
 @app.post("/api/events/{event_id}/register")
 async def register(event_id: int, payload: RegistrationIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    if not user.name or not user.gender or not user.birth_date or not (user.telegram or user.whatsapp or user.max_phone):
-        raise HTTPException(400, "Сначала заполните профиль, дату рождения и хотя бы один контакт")
+    required_fields = {
+        "фотографию": user.photo_url,
+        "номер телефона": user.phone,
+        "дату рождения": user.birth_date,
+        "имя": user.name,
+        "пол": user.gender,
+        "Telegram": user.telegram,
+    }
+    missing_fields = [label for label, value in required_fields.items() if not value]
+    if missing_fields:
+        raise HTTPException(400, f"Для записи заполните обязательные поля: {', '.join(missing_fields)}")
     if not payload.personal_data_consent or not payload.prepayment_consent:
         raise HTTPException(400, "Для записи нужны оба согласия")
     event = await db.scalar(select(Event).where(Event.id == event_id).options(selectinload(Event.registrations).selectinload(Registration.user)))
@@ -716,10 +761,19 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
     if taken >= capacity:
         raise HTTPException(409, "Свободных мест для вашего пола не осталось")
     now = datetime.now(timezone.utc)
+    notification_title = "Заявка успешно отправлена"
+    notification_body = (
+        f"Вы успешно записались на «{event.title}». "
+        "Организаторы скоро свяжутся с вами по контактам, указанным в профиле."
+    )
     db.add(Registration(event_id=event.id, user_id=user.id, pdata_consent_at=now, prepayment_consent_at=now))
     db.add(Notification(admin_only=True, title="Новая запись", body=f"{user.name}, {user_age} лет, записался(-ась) на «{event.title}»"))
+    db.add(Notification(user_id=user.id, title=notification_title, body=notification_body))
     await db.commit()
-    return {"registered": True}
+    return {
+        "registered": True,
+        "notification": {"title": notification_title, "body": notification_body},
+    }
 
 
 @app.put("/api/events/{event_id}/like")
@@ -857,11 +911,39 @@ async def submit_quiz(event_id: int, payload: QuizSubmitIn, user: User = Depends
     return {"completed": True}
 
 
+def visible_notifications(user: User):
+    if user.is_admin:
+        return or_(Notification.admin_only == True, Notification.user_id == user.id)
+    return Notification.user_id == user.id
+
+
 @app.get("/api/notifications")
 async def notifications(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    condition = Notification.admin_only == True if user.is_admin else Notification.user_id == user.id
+    condition = visible_notifications(user)
     rows = (await db.scalars(select(Notification).where(condition).order_by(Notification.created_at.desc()).limit(30))).all()
     return [{"id": x.id, "title": x.title, "body": x.body, "read": x.read, "created_at": x.created_at} for x in rows]
+
+
+@app.get("/api/notifications/unread-count")
+async def unread_notifications_count(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    count = await db.scalar(
+        select(func.count(Notification.id)).where(
+            visible_notifications(user),
+            Notification.read == False,
+        )
+    )
+    return {"unread": count or 0}
+
+
+@app.post("/api/notifications/read-all")
+async def read_all_notifications(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        update(Notification)
+        .where(visible_notifications(user), Notification.read == False)
+        .values(read=True)
+    )
+    await db.commit()
+    return {"read": True}
 
 
 @app.post("/api/admin/events")
