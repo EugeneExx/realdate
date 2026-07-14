@@ -16,6 +16,7 @@ import {
   CalendarDays,
   Check,
   ChevronLeft,
+  CircleCheckBig,
   ClipboardList,
   Clock3,
   Heart,
@@ -23,9 +24,11 @@ import {
   LogOut,
   MapPin,
   Menu,
+  Phone,
   Plus,
   Play,
   RotateCcw,
+  Send,
   Sparkles,
   ShieldCheck,
   Trash2,
@@ -81,12 +84,63 @@ const latestAdultBirthDate = () => {
   value.setFullYear(value.getFullYear() - 18);
   return format(value, "yyyy-MM-dd");
 };
+const SUPPORT_PHONE = "+7 999 080-01-37";
+const SUPPORT_PHONE_LINK = "tel:+79990800137";
+const SUPPORT_TELEGRAM_LINK =
+  "tg://resolve?domain=katy_sha_00&text=Здравствуйте%21%20Нужна%20помощь%20по%20REALDATE";
+const NOTIFICATIONS_CHANGED_EVENT = "realdate:notifications-changed";
+const notificationCountLabel = (count: number) => count > 9 ? "9+" : String(count);
+const telegramUsername = (value?: string) => {
+  if (!value) return null;
+  const normalized = value
+    .trim()
+    .replace(/^https?:\/\/(?:www\.)?(?:t\.me|telegram\.me)\//i, "")
+    .replace(/^@/, "")
+    .split(/[/?#]/)[0];
+  return /^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(normalized)
+    ? normalized
+    : null;
+};
+const participantTelegramLink = (user: User) => {
+  const draft = encodeURIComponent(
+    `Здравствуйте, ${user.name || "участник"}! Пишет организатор REALDATE.`,
+  );
+  const username = telegramUsername(user.telegram);
+  if (username) return `tg://resolve?domain=${username}&text=${draft}`;
+  const phone = user.phone.replace(/\D/g, "");
+  return `tg://resolve?phone=${phone}&text=${draft}`;
+};
 
 function Logo({ light = false }: { light?: boolean }) {
   return (
     <div className={`logo ${light ? "logo-light" : ""}`}>
       <span>REALDATE</span>
       <small>quickly</small>
+    </div>
+  );
+}
+
+function SupportContacts({ auth = false }: { auth?: boolean }) {
+  return (
+    <div className={`support-card ${auth ? "support-auth" : ""}`}>
+      <span>Поддержка</span>
+      <a href={SUPPORT_PHONE_LINK} aria-label={`Позвонить в поддержку ${SUPPORT_PHONE}`}>
+        <Phone />
+        <div>
+          <b>Позвонить</b>
+          <small>{SUPPORT_PHONE}</small>
+        </div>
+      </a>
+      <a
+        href={SUPPORT_TELEGRAM_LINK}
+        aria-label="Написать в поддержку в Telegram"
+      >
+        <Send />
+        <div>
+          <b>Telegram</b>
+          <small>@katy_sha_00</small>
+        </div>
+      </a>
     </div>
   );
 }
@@ -213,6 +267,7 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
             Продолжая, вы принимаете условия сервиса и политику
             конфиденциальности.
           </small>
+          <SupportContacts auth />
         </form>
       </section>
     </div>
@@ -228,9 +283,25 @@ function Shell({
 }) {
   const location = useLocation();
   const [mobile, setMobile] = useState(false);
+  const [unreadNotices, setUnreadNotices] = useState(0);
+  const refreshUnreadNotices = () => {
+    api.unreadNotifications()
+      .then(({ unread }) => setUnreadNotices(unread))
+      .catch(() => undefined);
+  };
   useEffect(() => {
     window.scrollTo(0, 0);
   }, [location.pathname]);
+  useEffect(() => {
+    void refreshUnreadNotices();
+    const handleNotificationsChanged = () => void refreshUnreadNotices();
+    const interval = window.setInterval(refreshUnreadNotices, 30_000);
+    window.addEventListener(NOTIFICATIONS_CHANGED_EVENT, handleNotificationsChanged);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener(NOTIFICATIONS_CHANGED_EVENT, handleNotificationsChanged);
+    };
+  }, [user.id, user.is_admin]);
   const items = [
     { to: "/", icon: CalendarDays, label: "События" },
     { to: "/my-events", icon: CalendarCheck2, label: "Мои встречи" },
@@ -273,9 +344,15 @@ function Shell({
             >
               <i.icon />
               <span>{i.label}</span>
+              {i.to === "/notices" && unreadNotices > 0 && (
+                <b className="notification-count" aria-label={`${unreadNotices} непрочитанных уведомлений`}>
+                  {notificationCountLabel(unreadNotices)}
+                </b>
+              )}
             </NavLink>
           ))}
         </nav>
+        <SupportContacts />
         <button
           className="logout"
           onClick={() => {
@@ -307,8 +384,17 @@ function Shell({
                 <span>Администратор</span>
               </div>
             )}
-            <NavLink to="/notices" className="icon-button" aria-label="Уведомления">
+            <NavLink
+              to="/notices"
+              className="icon-button notice-button"
+              aria-label={unreadNotices > 0 ? `Уведомления: ${unreadNotices} новых` : "Уведомления"}
+            >
               <Bell />
+              {unreadNotices > 0 && (
+                <b className="notification-count" aria-hidden="true">
+                  {notificationCountLabel(unreadNotices)}
+                </b>
+              )}
             </NavLink>
           </div>
         </header>
@@ -338,6 +424,11 @@ function Shell({
           <NavLink key={i.to} to={i.to} end={i.to === "/"}>
             <i.icon />
             <span>{i.label}</span>
+            {i.to === "/notices" && unreadNotices > 0 && (
+              <b className="notification-count" aria-label={`${unreadNotices} непрочитанных уведомлений`}>
+                {notificationCountLabel(unreadNotices)}
+              </b>
+            )}
           </NavLink>
         ))}
       </nav>
@@ -398,8 +489,8 @@ function EventCard({
   event: Event;
   featured?: boolean;
 }) {
-  const leftM = event.male_capacity - event.male_taken,
-    leftF = event.female_capacity - event.female_taken;
+  const leftM = Math.max(0, event.male_capacity - event.male_taken),
+    leftF = Math.max(0, event.female_capacity - event.female_taken);
   return (
     <article className={`event-card ${featured ? "featured" : ""}`}>
       <div className="card-art">
@@ -440,6 +531,7 @@ function EventCard({
           )}
         </div>
         <div className="availability">
+          <strong>Осталось:</strong>
           <span>
             Девушки <b>{leftF} {plural(leftF, "место", "места", "мест")}</b>
           </span>
@@ -475,6 +567,7 @@ function EventPage() {
   const { id } = useParams();
   const [event, setEvent] = useState<Event>();
   const [modal, setModal] = useState(false);
+  const [successNotice, setSuccessNotice] = useState<{ title: string; body: string } | null>(null);
   const [agree, setAgree] = useState([false, false]);
   const [error, setError] = useState("");
   const load = () => api.event(Number(id)).then(setEvent);
@@ -482,11 +575,17 @@ function EventPage() {
     void load();
   }, [id]);
   if (!event) return <Loader />;
+  const leftM = Math.max(0, event.male_capacity - event.male_taken);
+  const leftF = Math.max(0, event.female_capacity - event.female_taken);
   async function register() {
     try {
-      await api.register(event!.id);
+      setError("");
+      const result = await api.register(event!.id);
       setModal(false);
-      load();
+      setAgree([false, false]);
+      setSuccessNotice(result.notification);
+      window.dispatchEvent(new CustomEvent(NOTIFICATIONS_CHANGED_EVENT));
+      void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка");
     }
@@ -552,6 +651,19 @@ function EventPage() {
           <span>Участие</span>
           <strong>{money(event.price)}</strong>
           <p>В стоимость входит организация вечера и welcome drink.</p>
+          <div className="detail-availability">
+            <span>Осталось мест</span>
+            <div>
+              <p>
+                <b>{leftF}</b>
+                <small>для девушек</small>
+              </p>
+              <p>
+                <b>{leftM}</b>
+                <small>для мужчин</small>
+              </p>
+            </div>
+          </div>
           {event.registration?.participant_number && (
             <div className="my-number-panel">
               <span>Ваш номер на мероприятии</span>
@@ -644,6 +756,35 @@ function EventPage() {
               onClick={register}
             >
               Отправить заявку
+            </button>
+          </div>
+        </div>
+      )}
+      {successNotice && (
+        <div className="modal-wrap" onMouseDown={() => setSuccessNotice(null)}>
+          <div className="modal registration-success-modal" onMouseDown={(e) => e.stopPropagation()}>
+            <button
+              className="modal-close"
+              aria-label="Закрыть окно"
+              onClick={() => setSuccessNotice(null)}
+            >
+              <X />
+            </button>
+            <div className="registration-success-icon">
+              <CircleCheckBig />
+            </div>
+            <span className="eyebrow">Заявка принята</span>
+            <h2>{successNotice.title}</h2>
+            <p>{successNotice.body}</p>
+            <div className="registration-notice-hint">
+              <Bell />
+              <div>
+                <b>Сообщение добавлено в уведомления</b>
+                <small>Новый статус отмечен рядом со значком колокольчика.</small>
+              </div>
+            </div>
+            <button className="primary wide" onClick={() => setSuccessNotice(null)}>
+              Понятно
             </button>
           </div>
         </div>
@@ -907,6 +1048,7 @@ function Profile({
     name: user.name || "",
     gender: user.gender || "female",
     birth_date: user.birth_date || "",
+    email: user.email || "",
     bio: user.bio || "",
     telegram: user.telegram || "",
     whatsapp: user.whatsapp || "",
@@ -921,6 +1063,15 @@ function Profile({
       setError("Имя должно содержать не менее 2 символов");
       return;
     }
+    if (!form.photo_url) {
+      setError("Загрузите фотографию профиля");
+      return;
+    }
+    const telegram = telegramUsername(form.telegram);
+    if (!telegram) {
+      setError("Введите корректное имя Telegram, например @username");
+      return;
+    }
     const age = ageFromBirthDate(form.birth_date);
     if (age === null) {
       setError("Укажите дату рождения");
@@ -932,10 +1083,12 @@ function Profile({
     }
     try {
       const u = await api.updateMe({
-        ...form,
         name: form.name.trim(),
+        gender: form.gender,
+        birth_date: form.birth_date,
+        email: form.email.trim(),
         bio: form.bio.trim(),
-        telegram: form.telegram.trim(),
+        telegram: `@${telegram}`,
         whatsapp: form.whatsapp.trim(),
         max_phone: form.max_phone.trim(),
       });
@@ -961,7 +1114,6 @@ function Profile({
       <PageHead
         eyebrow="Личный кабинет"
         title="Ваш профиль"
-        copy="Именно это увидят другие участники во время встречи."
       />
       <form className="profile-layout" onSubmit={submit} noValidate>
         <div className="photo-editor">
@@ -985,11 +1137,14 @@ function Profile({
             />
           </label>
           <small>JPG, PNG или WebP до 5 МБ</small>
+          <small className="profile-required-note">Обязательно для записи на мероприятие</small>
         </div>
         <div className="form-card">
           <div className="two">
             <label>
-              Ваше имя
+              <span className="field-label">
+                Ваше имя <span className="required-mark">*</span>
+              </span>
               <input
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
@@ -997,7 +1152,9 @@ function Profile({
               />
             </label>
             <label>
-              Пол
+              <span className="field-label">
+                Пол <span className="required-mark">*</span>
+              </span>
               <select
                 value={form.gender}
                 onChange={(e) =>
@@ -1010,6 +1167,25 @@ function Profile({
                 <option value="female">Женский</option>
                 <option value="male">Мужской</option>
               </select>
+            </label>
+          </div>
+          <div className="two">
+            <label>
+              <span className="field-label">
+                Номер телефона <span className="required-mark">*</span>
+              </span>
+              <input value={form.phone} readOnly aria-readonly="true" className="readonly-field" />
+              <small className="input-help">Заполняется автоматически по номеру авторизации</small>
+            </label>
+            <label>
+              Email
+              <input
+                type="email"
+                maxLength={254}
+                placeholder="name@example.com"
+                value={form.email}
+                onChange={(e) => setForm({ ...form, email: e.target.value })}
+              />
             </label>
           </div>
           <div className="birth-row">
@@ -1025,14 +1201,16 @@ function Profile({
                 onChange={(e) => setForm({ ...form, birth_date: e.target.value })}
               />
             </label>
-            <div className="age-readout">
-              <small>Ваш возраст</small>
-              <b>
-                {ageFromBirthDate(form.birth_date) === null
-                  ? "—"
-                  : `${ageFromBirthDate(form.birth_date)} лет`}
-              </b>
-              <span>Рассчитывается автоматически</span>
+            <div className="age-field">
+              <span className="field-label">Ваш возраст</span>
+              <div className="age-readout">
+                <b>
+                  {ageFromBirthDate(form.birth_date) === null
+                    ? "—"
+                    : `${ageFromBirthDate(form.birth_date)} лет`}
+                </b>
+                <span>Рассчитывается автоматически</span>
+              </div>
             </div>
           </div>
           <label>
@@ -1049,8 +1227,11 @@ function Profile({
           <p className="form-help">Они откроются только после совпадения.</p>
           <div className="two">
             <label>
-              Telegram
+              <span className="field-label">
+                Telegram <span className="required-mark">*</span>
+              </span>
               <input
+                required
                 placeholder="@username"
                 value={form.telegram}
                 onChange={(e) => setForm({ ...form, telegram: e.target.value })}
@@ -1182,7 +1363,19 @@ function Notices() {
     Awaited<ReturnType<typeof api.notifications>>
   >([]);
   useEffect(() => {
-    api.notifications().then(setItems);
+    let active = true;
+    api.notifications().then((notices) => {
+      if (!active) return;
+      setItems(notices);
+      if (notices.some((notice) => !notice.read)) {
+        void api.readAllNotifications().then(() => {
+          window.dispatchEvent(new CustomEvent(NOTIFICATIONS_CHANGED_EVENT));
+        });
+      }
+    });
+    return () => {
+      active = false;
+    };
   }, []);
   return (
     <div className="page narrow">
@@ -1190,7 +1383,7 @@ function Notices() {
       <div className="notice-list">
         {items.length ? (
           items.map((n) => (
-            <article key={n.id}>
+            <article key={n.id} className={n.read ? "" : "unread"}>
               <div className="notice-icon">
                 <Bell />
               </div>
@@ -1199,6 +1392,7 @@ function Notices() {
                 <p>{n.body}</p>
                 <small>{dt(n.created_at)}</small>
               </div>
+              {!n.read && <span className="notice-new">Новое</span>}
             </article>
           ))
         ) : (
@@ -2111,10 +2305,29 @@ function AdminEventPage() {
                   </div>
                   <small>
                     {r.user.age !== undefined && r.user.age !== null
-                      ? `${r.user.age} лет · `
-                      : "Возраст не указан · "}
-                    {r.user.phone} {r.user.telegram && `· ${r.user.telegram}`}
+                      ? `${r.user.age} лет`
+                      : "Возраст не указан"}
                   </small>
+                  <a
+                    className="participant-phone"
+                    href={`tel:${r.user.phone.replace(/[^\d+]/g, "")}`}
+                    aria-label={`Позвонить ${r.user.name || "участнику"} по номеру ${r.user.phone}`}
+                    title={`Позвонить по номеру ${r.user.phone}`}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <Phone aria-hidden="true" />
+                    <span>Позвонить: {r.user.phone}</span>
+                  </a>
+                  <a
+                    className="participant-telegram"
+                    href={participantTelegramLink(r.user)}
+                    aria-label={`Написать ${r.user.name || "участнику"} в Telegram`}
+                  >
+                    <Send />
+                    {telegramUsername(r.user.telegram)
+                      ? `@${telegramUsername(r.user.telegram)}`
+                      : "Написать в Telegram по номеру"}
+                  </a>
                 </div>
               </div>
               <span className={`participant-number ${r.number ? "assigned" : ""}`}>

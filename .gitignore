@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.DS_Store
 __pycache__/
 .pytest_cache/
 .venv/
@@ -11,3 +12,6 @@ __pycache__/
 *.sqlite3
 uploads/*
 !uploads/.gitkeep
+**/uploads/*
+!**/uploads/.gitkeep
+outputs/*.inspect.ndjson

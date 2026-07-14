@@ -30,7 +30,7 @@ services:
       SMSAERO_SIGN: ${SMSAERO_SIGN:-SMSAero}
       ADMIN_PHONE: ${ADMIN_PHONE}
       ADMIN_PHONES: ${ADMIN_PHONES:-}
-      CORS_ORIGINS: https://${DOMAIN}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://${DOMAIN}}
       UPLOAD_DIR: /app/uploads
     volumes:
       - uploads:/app/uploads
@@ -59,6 +59,7 @@ services:
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN}
+      PREVIEW_DOMAIN: ${PREVIEW_DOMAIN}
       ACME_EMAIL: ${ACME_EMAIL}
     ports:
       - "80:80"
