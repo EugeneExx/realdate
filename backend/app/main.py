@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     otp_ip_hourly_limit: int = 30
     otp_phone_hourly_limit: int = 5
     otp_resend_seconds: int = 60
+    event_access_attempt_limit: int = 10
     telegram_bot_token: str | None = None
     telegram_bot_username: str | None = None
     telegram_bot_webhook_secret: str | None = None
@@ -68,6 +69,11 @@ def configured_admin_phones() -> set[str]:
     phones = {settings.admin_phone.strip()} if settings.admin_phone.strip() else set()
     phones.update(phone.strip() for phone in settings.admin_phones.split(",") if phone.strip())
     return phones
+
+
+def client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return forwarded or (request.client.host if request.client else None)
 
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
@@ -156,6 +162,15 @@ class OtpCode(Base):
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class EventAccessAttempt(Base):
+    __tablename__ = "event_access_attempts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone: Mapped[str] = mapped_column(String(24), index=True)
+    request_ip: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
 class Event(Base):
     __tablename__ = "events"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -171,6 +186,8 @@ class Event(Base):
     age_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[EventStatus] = mapped_column(SAEnum(EventStatus), default=EventStatus.registration)
     status_warning_sent_for: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    access_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    access_code_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     registrations: Mapped[list[Registration]] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True)
     quiz: Mapped[Quiz | None] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True, uselist=False, lazy="selectin")
@@ -306,6 +323,17 @@ class PhoneIn(BaseModel):
 
 class VerifyIn(PhoneIn):
     code: str = Field(min_length=4, max_length=6)
+
+
+class EventAccessVerifyIn(PhoneIn):
+    code: str = Field(min_length=6, max_length=6)
+
+    @field_validator("code")
+    @classmethod
+    def digits_only(cls, value: str) -> str:
+        if not value.isdigit():
+            raise ValueError("Код мероприятия должен состоять из шести цифр")
+        return value
 
 
 class ProfileIn(BaseModel):
@@ -460,6 +488,14 @@ def token_for(user: User) -> str:
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 
+def event_access_code_hash(event_id: int, code: str) -> str:
+    return hmac.new(
+        settings.jwt_secret.encode(),
+        f"event:{event_id}:{code}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 async def current_user(authorization: Annotated[str | None, Header()] = None, db: AsyncSession = Depends(get_db)) -> User:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Требуется авторизация")
@@ -591,6 +627,11 @@ def migrate_schema(sync_conn):
         sync_conn.execute(text("ALTER TABLE events ADD COLUMN age_max INTEGER"))
     if "status_warning_sent_for" not in event_columns:
         sync_conn.execute(text("ALTER TABLE events ADD COLUMN status_warning_sent_for VARCHAR(64)"))
+    if "access_code_hash" not in event_columns:
+        sync_conn.execute(text("ALTER TABLE events ADD COLUMN access_code_hash VARCHAR(64)"))
+    if "access_code_created_at" not in event_columns:
+        timestamp_type = "TIMESTAMP WITH TIME ZONE" if sync_conn.dialect.name == "postgresql" else "TIMESTAMP"
+        sync_conn.execute(text(f"ALTER TABLE events ADD COLUMN access_code_created_at {timestamp_type}"))
     user_columns = {column["name"] for column in inspector.get_columns("users")}
     if "birth_date" not in user_columns:
         sync_conn.execute(text("ALTER TABLE users ADD COLUMN birth_date DATE"))
@@ -1089,8 +1130,7 @@ async def add_low_gateway_balance_notification(db: AsyncSession, balance: Decima
 @app.post("/api/auth/request-code")
 async def request_code(payload: PhoneIn, request: Request, db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    request_ip = forwarded or (request.client.host if request.client else None)
+    request_ip = client_ip(request)
     if request_ip:
         hourly_requests = await db.scalar(
             select(func.count(OtpCode.id)).where(
@@ -1258,6 +1298,75 @@ async def verify(payload: VerifyIn, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(user)
     return {"access_token": token_for(user), "user": user_json(user, private=True)}
+
+
+@app.post("/api/auth/event-code/verify")
+async def verify_event_access_code(
+    payload: EventAccessVerifyIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    request_ip = client_ip(request)
+    recent_since = now - timedelta(minutes=15)
+    await db.execute(
+        delete(EventAccessAttempt).where(
+            EventAccessAttempt.created_at < now - timedelta(days=30)
+        )
+    )
+    attempt_scope = EventAccessAttempt.phone == payload.phone
+    if request_ip:
+        attempt_scope = or_(
+            attempt_scope,
+            EventAccessAttempt.request_ip == request_ip,
+        )
+    failed_attempts = await db.scalar(
+        select(func.count(EventAccessAttempt.id)).where(
+            EventAccessAttempt.success == False,
+            EventAccessAttempt.created_at >= recent_since,
+            attempt_scope,
+        )
+    )
+    if (failed_attempts or 0) >= settings.event_access_attempt_limit:
+        raise HTTPException(429, "Слишком много попыток. Повторите вход через 15 минут")
+
+    candidates = (
+        await db.execute(
+            select(Event, User)
+            .join(Registration, Registration.event_id == Event.id)
+            .join(User, User.id == Registration.user_id)
+            .where(
+                User.phone == payload.phone,
+                Registration.status == RegistrationStatus.confirmed,
+                Event.status == EventStatus.live,
+                Event.access_code_hash.is_not(None),
+            )
+        )
+    ).all()
+    authenticated_user: User | None = None
+    for event, user in candidates:
+        expected = event_access_code_hash(event.id, payload.code)
+        if event.access_code_hash and secrets.compare_digest(event.access_code_hash, expected):
+            authenticated_user = user
+            break
+
+    db.add(
+        EventAccessAttempt(
+            phone=payload.phone,
+            request_ip=request_ip,
+            success=authenticated_user is not None,
+        )
+    )
+    await db.commit()
+    if not authenticated_user:
+        raise HTTPException(
+            400,
+            "Код недействителен. Проверьте код, статус мероприятия и подтверждение вашей заявки",
+        )
+    return {
+        "access_token": token_for(authenticated_user),
+        "user": user_json(authenticated_user, private=True),
+    }
 
 
 @app.get("/api/me")
@@ -1786,6 +1895,10 @@ async def admin_event(event_id: int, _: User = Depends(admin_user), db: AsyncSes
     data = event_json(event)
     data.update(
         status_warning=event_status_warning(event),
+        event_access={
+            "active": event.status == EventStatus.live and bool(event.access_code_hash),
+            "created_at": event.access_code_created_at,
+        },
         registrations=[{"id": r.id, "status": r.status, "paid": r.paid, "number": r.participant_number, "user": user_json(r.user)} for r in event.registrations],
         stats={
             "registrations": len(event.registrations),
@@ -1798,6 +1911,43 @@ async def admin_event(event_id: int, _: User = Depends(admin_user), db: AsyncSes
         sympathies={"matches": matches, "one_sided": one_sided},
     )
     return data
+
+
+@app.post("/api/admin/events/{event_id}/access-code")
+async def generate_event_access_code(
+    event_id: int,
+    _: User = Depends(admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    event = await db.get(Event, event_id)
+    if not event:
+        raise HTTPException(404, "Мероприятие не найдено")
+    if event.status != EventStatus.live:
+        raise HTTPException(400, "Резервный код можно создать только во время мероприятия")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    event.access_code_hash = event_access_code_hash(event.id, code)
+    event.access_code_created_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {
+        "code": code,
+        "active": True,
+        "created_at": event.access_code_created_at,
+    }
+
+
+@app.delete("/api/admin/events/{event_id}/access-code")
+async def disable_event_access_code(
+    event_id: int,
+    _: User = Depends(admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    event = await db.get(Event, event_id)
+    if not event:
+        raise HTTPException(404, "Мероприятие не найдено")
+    event.access_code_hash = None
+    event.access_code_created_at = None
+    await db.commit()
+    return {"active": False}
 
 
 @app.get("/api/admin/events/{event_id}/quiz")
@@ -2110,6 +2260,9 @@ async def change_status(event_id: int, status: EventStatus, _: User = Depends(ad
                     reg.participant_number = number
     event.status = status
     event.status_warning_sent_for = None
+    if status != EventStatus.live:
+        event.access_code_hash = None
+        event.access_code_created_at = None
     if status == EventStatus.live and previous_status == EventStatus.registration:
         for reg in event.registrations:
             if reg.status == RegistrationStatus.confirmed:

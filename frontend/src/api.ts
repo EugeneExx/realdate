@@ -92,6 +92,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ phone, code }),
     }),
+  verifyEventCode: (phone: string, code: string) =>
+    request<{ access_token: string; user: User }>("/auth/event-code/verify", {
+      method: "POST",
+      body: JSON.stringify({ phone, code }),
+    }),
   me: () => request<User>("/me"),
   updateMe: (data: ProfileUpdate) =>
     request<User>("/me", { method: "PUT", body: JSON.stringify(data) }),
@@ -149,6 +154,12 @@ export const api = {
       body: JSON.stringify(data),
     }),
   adminEvent: (id: number) => request<AdminEvent>(`/admin/events/${id}`),
+  generateEventAccessCode: (id: number) =>
+    request<{ code: string; active: boolean; created_at: string }>(`/admin/events/${id}/access-code`, {
+      method: "POST",
+    }),
+  disableEventAccessCode: (id: number) =>
+    request<{ active: boolean }>(`/admin/events/${id}/access-code`, { method: "DELETE" }),
   adminQuiz: (id: number) => request<AdminQuiz>(`/admin/events/${id}/quiz`),
   uploadQuizImage: (id: number, file: File) => {
     const form = new FormData();
@@ -332,6 +343,10 @@ export type AdminEvent = Event & {
     title: string;
     body: string;
   } | null;
+  event_access: {
+    active: boolean;
+    created_at?: string;
+  };
   registrations: AdminRegistration[];
   stats: {
     registrations: number;

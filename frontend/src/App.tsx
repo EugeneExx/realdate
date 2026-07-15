@@ -20,7 +20,9 @@ import {
   CircleCheckBig,
   ClipboardList,
   Clock3,
+  Copy,
   Heart,
+  KeyRound,
   LayoutDashboard,
   LogOut,
   MapPin,
@@ -242,11 +244,31 @@ function SupportContacts({ auth = false }: { auth?: boolean }) {
           <small>@{publicConfig.supportTelegram}</small>
         </div>
       </a>
+      {!auth && (
+        <div className="developer-promo">
+          <span>Разработка сайта</span>
+          <a href="https://t.me/net_eugene" target="_blank" rel="noreferrer" aria-label="Заказать разработку сайта в Telegram">
+            <Send />
+            <div>
+              <b>Заказать сайт</b>
+              <small>@net_eugene</small>
+            </div>
+          </a>
+          <a href="tel:+79990800137" aria-label="Позвонить разработчику сайта +7 999 080-01-37">
+            <Phone />
+            <div>
+              <b>Разработчик</b>
+              <small>+7 999 080-01-37</small>
+            </div>
+          </a>
+        </div>
+      )}
     </div>
   );
 }
 
 function Auth({ onDone }: { onDone: (user: User) => void }) {
+  const [authMode, setAuthMode] = useState<"telegram" | "event">("telegram");
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
   const [step, setStep] = useState(1);
@@ -287,23 +309,36 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
     setDeliveryStatus(null);
   };
 
+  const changeAuthMode = (mode: "telegram" | "event") => {
+    setAuthMode(mode);
+    resetCodeStep();
+  };
+
   const deliveryFailed = deliveryStatus === "expired" || deliveryStatus === "revoked" || deliveryStatus === "failed";
   const deliveryReady = deliveryStatus === "delivered" || deliveryStatus === "read";
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    if (step === 1 && phone.length !== 10) {
+    if (phone.length !== 10) {
       setError("Введите 10 цифр номера после +7");
       return;
     }
-    if (step === 2 && code.length !== 4) {
+    if (authMode === "event" && code.length !== 6) {
+      setError("Введите шестизначный код мероприятия");
+      return;
+    }
+    if (authMode === "telegram" && step === 2 && code.length !== 4) {
       setError("Введите четырёхзначный код из сообщения");
       return;
     }
     setLoading(true);
     try {
       const fullPhone = `+7${phone}`;
-      if (step === 1) {
+      if (authMode === "event") {
+        const data = await api.verifyEventCode(fullPhone, code);
+        localStorage.setItem("realdate_token", data.access_token);
+        onDone(data.user);
+      } else if (step === 1) {
         const data = await api.requestCode(fullPhone);
         setStep(2);
         setDeliveryToken(data.status_token || "");
@@ -348,9 +383,11 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
             <Logo />
           </div>
           <span className="eyebrow">Добро пожаловать</span>
-          <h2>{step === 1 ? "Начнём знакомство" : "Подтвердите номер"}</h2>
+          <h2>{authMode === "event" ? "Вход на мероприятие" : step === 1 ? "Начнём знакомство" : "Подтвердите номер"}</h2>
           <p>
-            {step === 1
+            {authMode === "event"
+              ? "Введите номер аккаунта и резервный код, который сообщил организатор."
+              : step === 1
               ? "Введите номер — пришлём короткий код в Telegram."
               : deliveryFailed
                 ? "Telegram не доставил сообщение. Запросите новый код."
@@ -358,13 +395,39 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
                   ? "Код доставлен в Telegram. Введите его ниже."
                   : "Telegram принял сообщение. Проверяем доставку — обычно это занимает несколько секунд."}
           </p>
-          {step === 2 && (
+          <div className="auth-mode-tabs" role="tablist" aria-label="Способ входа">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={authMode === "telegram"}
+              className={authMode === "telegram" ? "active" : ""}
+              onClick={() => changeAuthMode("telegram")}
+            >
+              Код в Telegram
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={authMode === "event"}
+              className={authMode === "event" ? "active" : ""}
+              onClick={() => changeAuthMode("event")}
+            >
+              Код мероприятия
+            </button>
+          </div>
+          {authMode === "event" && (
+            <div className="event-code-note">
+              <ShieldCheck />
+              <span>Доступен только подтверждённым участникам, пока мероприятие идёт.</span>
+            </div>
+          )}
+          {authMode === "telegram" && step === 2 && (
             <div className={`otp-phone ${deliveryFailed ? "otp-phone-failed" : deliveryReady ? "otp-phone-ready" : ""}`}>
               <span>{deliveryFailed ? "Не доставлен на" : deliveryReady ? "Доставлен на" : "Отправляем на"}</span>
               <strong>+7 {formatRussianPhoneDigits(phone)}</strong>
             </div>
           )}
-          {step === 2 && deliveryChannel === "telegram" && (
+          {authMode === "telegram" && step === 2 && deliveryChannel === "telegram" && (
             <div className={`otp-delivery-status ${deliveryFailed ? "failed" : deliveryReady ? "ready" : "pending"}`} role="status">
               {deliveryFailed ? <X /> : deliveryReady ? <Check /> : <Clock3 />}
               <span>
@@ -376,7 +439,7 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
               </span>
             </div>
           )}
-          {step === 1 ? (
+          {(authMode === "event" || step === 1) && (
             <label>
               Номер телефона
               <div className="phone-field">
@@ -391,15 +454,17 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
                 />
               </div>
             </label>
-          ) : (
+          )}
+          {(authMode === "event" || step === 2) && (
             <label>
-              Код из сообщения
+              {authMode === "event" ? "Код мероприятия" : "Код из сообщения"}
               <input
                 className="code-field"
-                autoFocus
+                autoFocus={authMode === "telegram"}
                 inputMode="numeric"
-                maxLength={4}
-                placeholder="••••"
+                autoComplete="one-time-code"
+                maxLength={authMode === "event" ? 6 : 4}
+                placeholder={authMode === "event" ? "••••••" : "••••"}
                 value={code}
                 onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
               />
@@ -410,11 +475,13 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
           <button className="primary wide" disabled={loading || (step === 2 && deliveryFailed)}>
             {loading
               ? "Подождите…"
-              : step === 1
+              : authMode === "event"
+                ? "Войти на мероприятие"
+                : step === 1
                 ? "Получить код"
                 : "Продолжить"}
           </button>
-          {step === 2 && (
+          {authMode === "telegram" && step === 2 && (
             <button
               type="button"
               className="text-button"
@@ -2548,6 +2615,10 @@ function AdminEventPage() {
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [deleteError, setDeleteError] = useState("");
   const [statusError, setStatusError] = useState("");
+  const [eventAccessCode, setEventAccessCode] = useState("");
+  const [eventAccessError, setEventAccessError] = useState("");
+  const [eventAccessBusy, setEventAccessBusy] = useState(false);
+  const [eventAccessCopied, setEventAccessCopied] = useState(false);
   const load = () => api.adminEvent(Number(id)).then(setEvent);
   useEffect(() => {
     void load();
@@ -2569,9 +2640,49 @@ function AdminEventPage() {
     setStatusError("");
     try {
       await api.changeStatus(event!.id, value);
+      if (value !== "live") {
+        setEventAccessCode("");
+        setEventAccessCopied(false);
+      }
       load();
     } catch (e) {
       setStatusError(e instanceof Error ? e.message : "Не удалось изменить статус");
+    }
+  }
+  async function generateEventAccessCode() {
+    setEventAccessError("");
+    setEventAccessBusy(true);
+    setEventAccessCopied(false);
+    try {
+      const result = await api.generateEventAccessCode(event!.id);
+      setEventAccessCode(result.code);
+      await load();
+    } catch (e) {
+      setEventAccessError(e instanceof Error ? e.message : "Не удалось создать резервный код");
+    } finally {
+      setEventAccessBusy(false);
+    }
+  }
+  async function disableEventAccessCode() {
+    setEventAccessError("");
+    setEventAccessBusy(true);
+    try {
+      await api.disableEventAccessCode(event!.id);
+      setEventAccessCode("");
+      setEventAccessCopied(false);
+      await load();
+    } catch (e) {
+      setEventAccessError(e instanceof Error ? e.message : "Не удалось отключить резервный код");
+    } finally {
+      setEventAccessBusy(false);
+    }
+  }
+  async function copyEventAccessCode() {
+    try {
+      await navigator.clipboard.writeText(eventAccessCode);
+      setEventAccessCopied(true);
+    } catch {
+      setEventAccessError("Не удалось скопировать код. Выделите его вручную");
     }
   }
   async function removeEvent() {
@@ -2635,6 +2746,67 @@ function AdminEventPage() {
           </div>
         </div>
       )}
+      <section className={`event-access-panel ${event.event_access.active ? "active" : ""}`}>
+        <div className="event-access-heading">
+          <span className="event-access-icon"><KeyRound /></span>
+          <div>
+            <h2>Резервный вход на мероприятие</h2>
+            <p>Если код из Telegram не приходит, сообщите участнику этот код. Номер телефона должен совпадать с подтверждённой заявкой.</p>
+          </div>
+          <span className={`event-access-status ${event.event_access.active ? "active" : ""}`}>
+            {event.event_access.active ? "Активен" : "Неактивен"}
+          </span>
+        </div>
+        {event.status === "live" ? (
+          <div className="event-access-body">
+            <div className="event-access-code-wrap">
+              {eventAccessCode ? (
+                <>
+                  <span>Код для участников</span>
+                  <strong>{eventAccessCode}</strong>
+                  <small>Код показан полностью только сейчас. После обновления страницы создайте новый.</small>
+                </>
+              ) : event.event_access.active ? (
+                <>
+                  <span>Код уже создан</span>
+                  <b>Полное значение скрыто в целях безопасности</b>
+                  <small>{event.event_access.created_at ? `Создан ${dt(event.event_access.created_at)}` : "Можно заменить новым кодом"}</small>
+                </>
+              ) : (
+                <>
+                  <span>Резервный код ещё не создан</span>
+                  <b>Создайте его при необходимости</b>
+                  <small>Код будет работать только до выхода из статуса «Идёт».</small>
+                </>
+              )}
+            </div>
+            <div className="event-access-actions">
+              {eventAccessCode && (
+                <button type="button" className="secondary" onClick={copyEventAccessCode}>
+                  <Copy />
+                  {eventAccessCopied ? "Скопировано" : "Скопировать"}
+                </button>
+              )}
+              <button type="button" className="primary" disabled={eventAccessBusy} onClick={generateEventAccessCode}>
+                {event.event_access.active ? <RotateCcw /> : <KeyRound />}
+                {eventAccessBusy ? "Подождите…" : event.event_access.active ? "Создать новый" : "Создать код"}
+              </button>
+              {event.event_access.active && (
+                <button type="button" className="danger-button" disabled={eventAccessBusy} onClick={disableEventAccessCode}>
+                  <X />
+                  Отключить
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="event-access-unavailable">
+            <Clock3 />
+            <span>Генерация доступна только в статусе «Идёт». После завершения или отмены мероприятия код отключается автоматически.</span>
+          </div>
+        )}
+        {eventAccessError && <div className="error event-access-error">{eventAccessError}</div>}
+      </section>
       <div className="stats">
         <div>
           <Users />
