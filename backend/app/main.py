@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
+import logging
 import os
 import random
 import re
@@ -38,6 +40,11 @@ class Settings(BaseSettings):
     otp_provider: str = "console"
     telegram_gateway_token: str | None = None
     telegram_sender_username: str | None = None
+    telegram_gateway_callback_url: str | None = None
+    telegram_gateway_low_balance_threshold: Decimal = Decimal("1.00")
+    otp_ip_hourly_limit: int = 30
+    otp_phone_hourly_limit: int = 5
+    otp_resend_seconds: int = 60
     telegram_bot_token: str | None = None
     telegram_bot_username: str | None = None
     telegram_bot_webhook_secret: str | None = None
@@ -49,11 +56,12 @@ class Settings(BaseSettings):
     admin_phone: str = "+79990000000"
     admin_phones: str = ""
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    event_timezone: str = "Asia/Vladivostok"
+    event_timezone: str = "Asia/Khabarovsk"
 
 
 settings = Settings()
 reminder_task: asyncio.Task[None] | None = None
+logger = logging.getLogger("realdate")
 
 
 def configured_admin_phones() -> set[str]:
@@ -137,6 +145,15 @@ class OtpCode(Base):
     used: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     request_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivery_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    gateway_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    gateway_delivery_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gateway_verification_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gateway_request_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    gateway_remaining_balance: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    gateway_is_refunded: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    gateway_error: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Event(Base):
@@ -587,6 +604,22 @@ def migrate_schema(sync_conn):
         sync_conn.execute(text("UPDATE otp_codes SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
     if "request_ip" not in otp_columns:
         sync_conn.execute(text("ALTER TABLE otp_codes ADD COLUMN request_ip VARCHAR(64)"))
+    otp_additions = {
+        "delivery_token": "VARCHAR(64)",
+        "gateway_request_id": "VARCHAR(128)",
+        "gateway_delivery_status": "VARCHAR(32)",
+        "gateway_verification_status": "VARCHAR(64)",
+        "gateway_request_cost": "NUMERIC(12, 6)",
+        "gateway_remaining_balance": "NUMERIC(12, 6)",
+        "gateway_is_refunded": "BOOLEAN",
+        "gateway_error": "VARCHAR(160)",
+        "verified_at": "TIMESTAMP WITH TIME ZONE" if sync_conn.dialect.name == "postgresql" else "TIMESTAMP",
+    }
+    for column_name, column_type in otp_additions.items():
+        if column_name not in otp_columns:
+            sync_conn.execute(text(f"ALTER TABLE otp_codes ADD COLUMN {column_name} {column_type}"))
+    sync_conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_otp_codes_delivery_token ON otp_codes (delivery_token)"))
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_otp_codes_gateway_request_id ON otp_codes (gateway_request_id)"))
     registration_columns = {column["name"] for column in inspector.get_columns("registrations")}
     if "reminder_24h_sent_at" not in registration_columns:
         sync_conn.execute(text("ALTER TABLE registrations ADD COLUMN reminder_24h_sent_at TIMESTAMP WITH TIME ZONE"))
@@ -606,8 +639,8 @@ async def startup():
             await db.commit()
         if not (await db.scalar(select(Event.id).limit(1))):
             db.add_all([
-                Event(title="Вечер быстрых знакомств", description="Камерный вечер в центре города: 8 коротких встреч, лёгкая музыка и welcome drink.", starts_at=datetime.now(timezone.utc) + timedelta(days=6, hours=3), venue="Бар «Север»", address="ул. Светланская, 33", price=2500, male_capacity=8, female_capacity=8, age_min=25, age_max=40),
-                Event(title="Знакомства & вино", description="Неспешный формат для тех, кто ценит живой разговор и хорошую атмосферу.", starts_at=datetime.now(timezone.utc) + timedelta(days=14, hours=1), venue="Винный зал Blanc", address="Океанский проспект, 17", price=3200, male_capacity=10, female_capacity=10, age_min=30, age_max=45),
+                Event(title="Вечер быстрых знакомств", description="Камерный вечер в центре Хабаровска: 8 коротких встреч, лёгкая музыка и welcome drink.", starts_at=datetime.now(timezone.utc) + timedelta(days=6, hours=3), venue="Бар «Север»", address="ул. Муравьёва-Амурского, 33", price=2500, male_capacity=8, female_capacity=8, age_min=25, age_max=40),
+                Event(title="Знакомства & вино", description="Неспешный формат для тех, кто ценит живой разговор и хорошую атмосферу.", starts_at=datetime.now(timezone.utc) + timedelta(days=14, hours=1), venue="Винный зал Blanc", address="Амурский бульвар, 17", price=3200, male_capacity=10, female_capacity=10, age_min=30, age_max=45),
             ])
             await db.commit()
     start_reminder_scheduler()
@@ -761,28 +794,134 @@ def start_reminder_scheduler() -> None:
         reminder_task = asyncio.create_task(reminder_scheduler())
 
 
-async def deliver_otp(phone: str, code: str, request_ip: str | None = None) -> None:
+class GatewayDeliveryError(Exception):
+    def __init__(self, code: str, public_message: str, status_code: int = 502):
+        super().__init__(public_message)
+        self.code = code[:160]
+        self.public_message = public_message
+        self.status_code = status_code
+
+
+def gateway_error_details(data: object, status_code: int) -> tuple[str, str]:
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        error_code = str(error.get("code") or error.get("type") or status_code)
+        error_text = str(error.get("message") or error.get("description") or error_code)
+    else:
+        error_code = str(status_code)
+        error_text = str(error or "Telegram Gateway rejected the request")
+    searchable = f"{error_code} {error_text}".lower()
+    if any(word in searchable for word in ("balance", "credit", "fund", "payment")):
+        public = "На балансе Telegram Gateway недостаточно средств. Сообщите администратору"
+    elif any(word in searchable for word in ("phone", "number", "recipient", "registered")):
+        public = "Этот номер сейчас недоступен для получения кода через Telegram. Проверьте номер и аккаунт Telegram"
+    elif any(word in searchable for word in ("token", "unauthorized", "forbidden", "access")):
+        public = "Сервис Telegram Gateway временно не настроен. Сообщите администратору"
+    elif any(word in searchable for word in ("sender", "channel")):
+        public = "Отправитель Telegram Gateway настроен неверно. Сообщите администратору"
+    else:
+        public = "Telegram не смог отправить код. Попробуйте позже"
+    return error_code[:160], public
+
+
+async def telegram_gateway_call(method: str, payload: dict) -> dict:
+    if not settings.telegram_gateway_token:
+        raise GatewayDeliveryError("not_configured", "Telegram Gateway не настроен", 500)
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.post(
+                f"https://gatewayapi.telegram.org/{method}",
+                headers={"Authorization": f"Bearer {settings.telegram_gateway_token}"},
+                json=payload,
+            )
+        data = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Telegram Gateway %s unavailable: %s", method, type(error).__name__)
+        raise GatewayDeliveryError(
+            "gateway_unavailable",
+            "Telegram Gateway временно недоступен. Попробуйте ещё раз",
+            503,
+        ) from error
+    if response.status_code >= 400 or not isinstance(data, dict) or not data.get("ok"):
+        internal_error, public_error = gateway_error_details(data, response.status_code)
+        logger.warning("Telegram Gateway %s rejected request: HTTP %s, code %s", method, response.status_code, internal_error)
+        raise GatewayDeliveryError(internal_error, public_error)
+    result = data.get("result")
+    if not isinstance(result, dict):
+        raise GatewayDeliveryError("invalid_response", "Telegram Gateway вернул некорректный ответ. Попробуйте позже")
+    return result
+
+
+def nested_status(result: dict, field: str) -> str | None:
+    value = result.get(field)
+    if isinstance(value, dict):
+        status = value.get("status")
+        return str(status) if status else None
+    return str(value) if value else None
+
+
+def optional_decimal(value: object) -> Decimal | None:
+    try:
+        return Decimal(str(value)) if value is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def apply_gateway_status(otp: OtpCode, result: dict) -> None:
+    request_id = result.get("request_id")
+    if request_id:
+        otp.gateway_request_id = str(request_id)[:128]
+    new_delivery_status = nested_status(result, "delivery_status")
+    status_rank = {"pending": 0, "sent": 1, "delivered": 2, "read": 3, "expired": 4, "revoked": 4, "failed": 4}
+    if new_delivery_status and status_rank.get(new_delivery_status, 0) >= status_rank.get(otp.gateway_delivery_status or "pending", 0):
+        otp.gateway_delivery_status = new_delivery_status[:32]
+    verification_status = nested_status(result, "verification_status")
+    if verification_status:
+        otp.gateway_verification_status = verification_status[:64]
+    request_cost = optional_decimal(result.get("request_cost"))
+    remaining_balance = optional_decimal(result.get("remaining_balance"))
+    if request_cost is not None:
+        otp.gateway_request_cost = request_cost
+    if remaining_balance is not None:
+        otp.gateway_remaining_balance = remaining_balance
+    if result.get("is_refunded") is not None:
+        otp.gateway_is_refunded = bool(result.get("is_refunded"))
+
+
+async def deliver_otp(
+    phone: str,
+    code: str,
+    request_ip: str | None = None,
+    delivery_token: str | None = None,
+) -> dict:
     provider = settings.otp_provider.lower()
     if provider == "console":
         print(f"REALDATE OTP for {phone}: {code}")
-        return
+        return {"delivery_status": {"status": "sent"}}
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             if provider == "telegram":
-                if not settings.telegram_gateway_token:
-                    raise HTTPException(500, "Telegram Gateway не настроен")
-                payload = {"phone_number": phone, "code": code, "ttl": 300}
+                if not settings.telegram_gateway_callback_url:
+                    raise GatewayDeliveryError(
+                        "callback_not_configured",
+                        "Callback Telegram Gateway не настроен. Сообщите администратору",
+                        500,
+                    )
+                ability = await telegram_gateway_call("checkSendAbility", {"phone_number": phone})
+                request_id = ability.get("request_id")
+                if not request_id:
+                    raise GatewayDeliveryError("missing_request_id", "Telegram Gateway вернул некорректный ответ. Попробуйте позже")
+                payload = {
+                    "phone_number": phone,
+                    "code": code,
+                    "ttl": 300,
+                    "request_id": request_id,
+                    "callback_url": settings.telegram_gateway_callback_url,
+                    "payload": delivery_token,
+                }
                 if settings.telegram_sender_username:
                     payload["sender_username"] = settings.telegram_sender_username
-                response = await client.post(
-                    "https://gatewayapi.telegram.org/sendVerificationMessage",
-                    headers={"Authorization": f"Bearer {settings.telegram_gateway_token}"},
-                    json=payload,
-                )
-                data = response.json()
-                if response.status_code >= 400 or not data.get("ok"):
-                    raise HTTPException(502, "Не удалось отправить код через Telegram. Попробуйте позже")
-                return
+                return await telegram_gateway_call("sendVerificationMessage", payload)
             if provider == "smsru":
                 if not settings.smsru_api_id:
                     raise HTTPException(500, "SMS.ru не настроен")
@@ -801,7 +940,7 @@ async def deliver_otp(phone: str, code: str, request_ip: str | None = None) -> N
                 sms_status = (data.get("sms") or {}).get(phone.lstrip("+"), {})
                 if response.status_code >= 400 or data.get("status") != "OK" or sms_status.get("status") != "OK":
                     raise HTTPException(502, "Не удалось отправить SMS-код. Проверьте баланс и настройки SMS.ru")
-                return
+                return {"delivery_status": {"status": "sent"}}
             if provider == "smsaero":
                 if not settings.smsaero_email or not settings.smsaero_api_key:
                     raise HTTPException(500, "SMS Aero не настроен")
@@ -817,12 +956,32 @@ async def deliver_otp(phone: str, code: str, request_ip: str | None = None) -> N
                 data = response.json()
                 if response.status_code >= 400 or not data.get("success"):
                     raise HTTPException(502, "Не удалось отправить SMS-код через SMS Aero. Проверьте баланс и имя отправителя")
-                return
+                return {"delivery_status": {"status": "sent"}}
+    except GatewayDeliveryError:
+        raise
     except HTTPException:
         raise
     except (httpx.HTTPError, ValueError):
         raise HTTPException(503, "Сервис отправки кодов временно недоступен")
     raise HTTPException(500, "Неизвестный OTP-провайдер")
+
+
+async def add_low_gateway_balance_notification(db: AsyncSession, balance: Decimal | None) -> None:
+    if balance is None or balance >= settings.telegram_gateway_low_balance_threshold:
+        return
+    recent = await db.scalar(
+        select(Notification.id).where(
+            Notification.admin_only == True,
+            Notification.title == "Низкий баланс Telegram Gateway",
+            Notification.created_at >= datetime.now(timezone.utc) - timedelta(hours=6),
+        ).limit(1)
+    )
+    if not recent:
+        db.add(Notification(
+            admin_only=True,
+            title="Низкий баланс Telegram Gateway",
+            body=f"Остаток баланса: {balance}. Пополните его, чтобы авторизация продолжала работать.",
+        ))
 
 
 @app.post("/api/auth/request-code")
@@ -837,17 +996,132 @@ async def request_code(payload: PhoneIn, request: Request, db: AsyncSession = De
                 OtpCode.created_at >= now - timedelta(hours=1),
             )
         )
-        if (hourly_requests or 0) >= 10:
+        if (hourly_requests or 0) >= settings.otp_ip_hourly_limit:
             raise HTTPException(429, "Превышен лимит запросов кодов. Попробуйте через час")
-    latest = await db.scalar(select(OtpCode).where(OtpCode.phone == payload.phone).order_by(OtpCode.id.desc()).limit(1))
-    if latest and latest.created_at and now - normalize_dt(latest.created_at) < timedelta(seconds=60):
-        raise HTTPException(429, "Новый код можно запросить через 60 секунд")
+    phone_requests = await db.scalar(
+        select(func.count(OtpCode.id)).where(
+            OtpCode.phone == payload.phone,
+            OtpCode.created_at >= now - timedelta(hours=1),
+            or_(OtpCode.gateway_delivery_status.is_(None), OtpCode.gateway_delivery_status != "failed"),
+        )
+    )
+    if (phone_requests or 0) >= settings.otp_phone_hourly_limit:
+        raise HTTPException(429, "Для этого номера превышен лимит кодов. Попробуйте через час")
+    latest = await db.scalar(
+        select(OtpCode).where(
+            OtpCode.phone == payload.phone,
+            or_(OtpCode.gateway_delivery_status.is_(None), OtpCode.gateway_delivery_status != "failed"),
+        ).order_by(OtpCode.id.desc()).limit(1)
+    )
+    if latest and latest.created_at and now - normalize_dt(latest.created_at) < timedelta(seconds=settings.otp_resend_seconds):
+        raise HTTPException(429, f"Новый код можно запросить через {settings.otp_resend_seconds} секунд")
     code = "1111" if settings.otp_provider == "console" else f"{secrets.randbelow(10000):04d}"
-    await deliver_otp(payload.phone, code, request_ip)
     await db.execute(update(OtpCode).where(OtpCode.phone == payload.phone, OtpCode.used == False).values(used=True))
-    db.add(OtpCode(phone=payload.phone, code_hash=hashlib.sha256((code + settings.jwt_secret).encode()).hexdigest(), expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), request_ip=request_ip))
+    delivery_token = secrets.token_urlsafe(24)
+    otp = OtpCode(
+        phone=payload.phone,
+        code_hash=hashlib.sha256((code + settings.jwt_secret).encode()).hexdigest(),
+        expires_at=now + timedelta(minutes=5),
+        request_ip=request_ip,
+        delivery_token=delivery_token,
+        gateway_delivery_status="pending",
+    )
+    db.add(otp)
     await db.commit()
-    return {"sent": True, "channel": settings.otp_provider, "dev_code": code if settings.otp_provider == "console" else None}
+    try:
+        delivery_result = await deliver_otp(payload.phone, code, request_ip, delivery_token)
+    except GatewayDeliveryError as error:
+        await db.refresh(otp)
+        otp.gateway_delivery_status = "failed"
+        otp.gateway_error = error.code
+        otp.used = True
+        await db.commit()
+        raise HTTPException(error.status_code, error.public_message) from error
+    except HTTPException:
+        await db.refresh(otp)
+        otp.gateway_delivery_status = "failed"
+        otp.used = True
+        await db.commit()
+        raise
+    except Exception as error:
+        await db.refresh(otp)
+        otp.gateway_delivery_status = "failed"
+        otp.gateway_error = "unexpected_delivery_error"
+        otp.used = True
+        await db.commit()
+        logger.exception("Unexpected OTP delivery error: %s", type(error).__name__)
+        raise HTTPException(503, "Сервис отправки кодов временно недоступен. Попробуйте ещё раз") from error
+    await db.refresh(otp)
+    apply_gateway_status(otp, delivery_result)
+    await add_low_gateway_balance_notification(db, otp.gateway_remaining_balance)
+    await db.commit()
+    return {
+        "sent": True,
+        "channel": settings.otp_provider,
+        "status_token": delivery_token,
+        "delivery_status": otp.gateway_delivery_status or "sent",
+        "dev_code": code if settings.otp_provider == "console" else None,
+    }
+
+
+def verify_gateway_callback_signature(timestamp: str, signature: str, body: bytes) -> bool:
+    if not settings.telegram_gateway_token:
+        return False
+    try:
+        timestamp_value = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(datetime.now(timezone.utc).timestamp()) - timestamp_value) > 300:
+        return False
+    secret_key = hashlib.sha256(settings.telegram_gateway_token.encode()).digest()
+    expected = hmac.new(secret_key, timestamp.encode() + b"\n" + body, hashlib.sha256).hexdigest()
+    return secrets.compare_digest(expected, signature.lower())
+
+
+@app.post("/api/auth/telegram-gateway/callback")
+async def telegram_gateway_callback(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.body()
+    timestamp = request.headers.get("x-request-timestamp", "")
+    signature = request.headers.get("x-request-signature", "")
+    if not verify_gateway_callback_signature(timestamp, signature, body):
+        raise HTTPException(403, "Некорректная подпись callback")
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(400, "Некорректный callback")
+    result = data.get("result", data) if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        raise HTTPException(400, "Некорректный callback")
+    payload_token = result.get("payload")
+    request_id = result.get("request_id")
+    otp = None
+    if payload_token:
+        otp = await db.scalar(select(OtpCode).where(OtpCode.delivery_token == str(payload_token)))
+    if not otp and request_id:
+        otp = await db.scalar(select(OtpCode).where(OtpCode.gateway_request_id == str(request_id)).order_by(OtpCode.id.desc()))
+    if otp:
+        apply_gateway_status(otp, result)
+        if otp.gateway_delivery_status in {"expired", "revoked", "failed"}:
+            otp.used = True
+        await add_low_gateway_balance_notification(db, otp.gateway_remaining_balance)
+        await db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/auth/code-status/{status_token}")
+async def code_status(status_token: str, db: AsyncSession = Depends(get_db)):
+    if len(status_token) < 20 or len(status_token) > 64:
+        raise HTTPException(404, "Запрос кода не найден")
+    otp = await db.scalar(select(OtpCode).where(OtpCode.delivery_token == status_token))
+    if not otp:
+        raise HTTPException(404, "Запрос кода не найден")
+    status = otp.gateway_delivery_status or "pending"
+    if normalize_dt(otp.expires_at) < datetime.now(timezone.utc) and status in {"pending", "sent"}:
+        status = "expired"
+        otp.gateway_delivery_status = status
+        otp.used = True
+        await db.commit()
+    return {"status": status, "expires_at": normalize_dt(otp.expires_at).isoformat()}
 
 
 @app.post("/api/auth/verify")
@@ -861,6 +1135,18 @@ async def verify(payload: VerifyIn, db: AsyncSession = Depends(get_db)):
         await db.commit()
         raise HTTPException(400, "Неверный код")
     otp.used = True
+    otp.verified_at = datetime.now(timezone.utc)
+    if settings.otp_provider.lower() == "telegram" and otp.gateway_request_id:
+        try:
+            gateway_result = await telegram_gateway_call(
+                "checkVerificationStatus",
+                {"request_id": otp.gateway_request_id, "code": payload.code},
+            )
+            apply_gateway_status(otp, gateway_result)
+            await add_low_gateway_balance_notification(db, otp.gateway_remaining_balance)
+        except GatewayDeliveryError as error:
+            otp.gateway_error = error.code
+            logger.warning("Telegram Gateway verification status was not recorded: %s", error.code)
     user = await db.scalar(select(User).where(User.phone == payload.phone))
     if not user:
         user = User(phone=payload.phone, is_admin=payload.phone in configured_admin_phones())

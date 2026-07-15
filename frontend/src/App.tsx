@@ -46,6 +46,7 @@ import {
   AdminSympathyUser,
   Event,
   ParticipantQuiz,
+  OtpDeliveryStatus,
   Person,
   QuizEditorQuestion,
   QuizQuestionType,
@@ -173,6 +174,42 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [hint, setHint] = useState("");
+  const [deliveryToken, setDeliveryToken] = useState("");
+  const [deliveryChannel, setDeliveryChannel] = useState("");
+  const [deliveryStatus, setDeliveryStatus] = useState<OtpDeliveryStatus | null>(null);
+
+  useEffect(() => {
+    if (step !== 2 || deliveryChannel !== "telegram" || !deliveryToken || !deliveryStatus || ["delivered", "read", "expired", "revoked", "failed"].includes(deliveryStatus))
+      return;
+    let stopped = false;
+    const checkStatus = async () => {
+      try {
+        const result = await api.codeStatus(deliveryToken);
+        if (!stopped) setDeliveryStatus(result.status);
+      } catch {
+        // Кратковременная ошибка проверки не мешает ввести уже полученный код.
+      }
+    };
+    const timer = window.setInterval(checkStatus, 2500);
+    void checkStatus();
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [step, deliveryChannel, deliveryToken, deliveryStatus]);
+
+  const resetCodeStep = () => {
+    setStep(1);
+    setCode("");
+    setHint("");
+    setError("");
+    setDeliveryToken("");
+    setDeliveryChannel("");
+    setDeliveryStatus(null);
+  };
+
+  const deliveryFailed = deliveryStatus === "expired" || deliveryStatus === "revoked" || deliveryStatus === "failed";
+  const deliveryReady = deliveryStatus === "delivered" || deliveryStatus === "read";
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
@@ -190,6 +227,9 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
       if (step === 1) {
         const data = await api.requestCode(fullPhone);
         setStep(2);
+        setDeliveryToken(data.status_token || "");
+        setDeliveryChannel(data.channel);
+        setDeliveryStatus(data.delivery_status || "sent");
         if (import.meta.env.DEV && data.dev_code)
           setHint(`Код для локального запуска: ${data.dev_code}`);
       } else {
@@ -233,12 +273,28 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
           <p>
             {step === 1
               ? "Введите номер — пришлём короткий код в Telegram."
-              : "Мы отправили код на ваш номер. Обычно он приходит за несколько секунд."}
+              : deliveryFailed
+                ? "Telegram не доставил сообщение. Запросите новый код."
+                : deliveryReady
+                  ? "Код доставлен в Telegram. Введите его ниже."
+                  : "Telegram принял сообщение. Проверяем доставку — обычно это занимает несколько секунд."}
           </p>
           {step === 2 && (
-            <div className="otp-phone">
-              <span>Код отправлен на</span>
+            <div className={`otp-phone ${deliveryFailed ? "otp-phone-failed" : deliveryReady ? "otp-phone-ready" : ""}`}>
+              <span>{deliveryFailed ? "Не доставлен на" : deliveryReady ? "Доставлен на" : "Отправляем на"}</span>
               <strong>+7 {formatRussianPhoneDigits(phone)}</strong>
+            </div>
+          )}
+          {step === 2 && deliveryChannel === "telegram" && (
+            <div className={`otp-delivery-status ${deliveryFailed ? "failed" : deliveryReady ? "ready" : "pending"}`} role="status">
+              {deliveryFailed ? <X /> : deliveryReady ? <Check /> : <Clock3 />}
+              <span>
+                {deliveryFailed
+                  ? "Код не доставлен. Деньги за недоставленное сообщение возвращаются на баланс Gateway автоматически."
+                  : deliveryReady
+                    ? "Сообщение доставлено"
+                    : "Ожидаем подтверждение доставки от Telegram"}
+              </span>
             </div>
           )}
           {step === 1 ? (
@@ -272,7 +328,7 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
           )}
           {hint && <div className="dev-hint">{hint}</div>}
           {error && <div className="error">{error}</div>}
-          <button className="primary wide" disabled={loading}>
+          <button className="primary wide" disabled={loading || (step === 2 && deliveryFailed)}>
             {loading
               ? "Подождите…"
               : step === 1
@@ -283,9 +339,9 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
             <button
               type="button"
               className="text-button"
-              onClick={() => setStep(1)}
+              onClick={resetCodeStep}
             >
-              Изменить номер
+              {deliveryFailed ? "Запросить новый код" : "Изменить номер"}
             </button>
           )}
           <small className="legal">

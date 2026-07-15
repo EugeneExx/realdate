@@ -69,7 +69,7 @@ function PublicFooter() {
       <div className="public-container public-footer-grid">
         <div>
           <PublicLogo />
-          <p>Живые быстрые знакомства во Владивостоке.</p>
+          <p>Живые быстрые знакомства в Хабаровске.</p>
         </div>
         <div>
           <b>Участникам</b>

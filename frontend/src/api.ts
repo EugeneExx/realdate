@@ -73,10 +73,20 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   publicEvents: () => request<Event[]>("/public/events"),
   requestCode: (phone: string) =>
-    request<{ sent: boolean; dev_code?: string }>("/auth/request-code", {
+    request<{
+      sent: boolean;
+      channel: string;
+      status_token?: string;
+      delivery_status?: OtpDeliveryStatus;
+      dev_code?: string;
+    }>("/auth/request-code", {
       method: "POST",
       body: JSON.stringify({ phone }),
     }),
+  codeStatus: (statusToken: string) =>
+    request<{ status: OtpDeliveryStatus; expires_at: string }>(
+      `/auth/code-status/${encodeURIComponent(statusToken)}`,
+    ),
   verify: (phone: string, code: string) =>
     request<{ access_token: string; user: User }>("/auth/verify", {
       method: "POST",
@@ -160,6 +170,7 @@ export const api = {
 };
 
 export type Gender = "male" | "female";
+export type OtpDeliveryStatus = "pending" | "sent" | "delivered" | "read" | "expired" | "revoked" | "failed";
 export type User = {
   id: number;
   phone: string;

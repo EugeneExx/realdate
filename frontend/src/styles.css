@@ -273,6 +273,45 @@
   color: var(--wine);
   white-space: nowrap;
 }
+.otp-phone-ready {
+  border-color: rgba(56, 103, 77, 0.28);
+  background: #edf5f0;
+}
+.otp-phone-ready strong {
+  color: var(--green);
+}
+.otp-phone-failed {
+  border-color: rgba(154, 30, 41, 0.2);
+  background: #fae9e9;
+}
+.otp-delivery-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: -10px 0 20px;
+  padding: 11px 13px;
+  border-radius: 9px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.otp-delivery-status svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.otp-delivery-status.pending {
+  color: #6c5520;
+  background: #f5eedf;
+}
+.otp-delivery-status.ready {
+  color: var(--green);
+  background: #edf5f0;
+}
+.otp-delivery-status.failed {
+  color: #9a1e29;
+  background: #fae9e9;
+}
 .auth-card label,
 .modal label,
 .form-card label {
