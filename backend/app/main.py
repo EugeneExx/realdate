@@ -170,6 +170,7 @@ class Event(Base):
     age_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
     age_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[EventStatus] = mapped_column(SAEnum(EventStatus), default=EventStatus.registration)
+    status_warning_sent_for: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     registrations: Mapped[list[Registration]] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True)
     quiz: Mapped[Quiz | None] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True, uselist=False, lazy="selectin")
@@ -185,6 +186,7 @@ class Registration(Base):
     paid: Mapped[bool] = mapped_column(Boolean, default=False)
     pdata_consent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     prepayment_consent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    adult_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     participant_number: Mapped[int | None] = mapped_column(Integer)
     reminder_24h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reminder_2h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -391,6 +393,7 @@ class EventIn(BaseModel):
 class RegistrationIn(BaseModel):
     personal_data_consent: bool
     prepayment_consent: bool
+    adult_confirmation: bool
 
 
 class LikeIn(BaseModel):
@@ -448,7 +451,7 @@ def normalize_dt(value: datetime) -> datetime:
 
 
 def calculate_age(birth_date: date) -> int:
-    today = date.today()
+    today = datetime.now(event_timezone()).date()
     return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
 
 
@@ -546,6 +549,7 @@ FIELD_NAMES = {
     "starts_at": "Дата и время", "venue": "Площадка", "address": "Адрес",
     "price": "Стоимость", "male_capacity": "Мест для мужчин",
     "female_capacity": "Мест для девушек", "age_min": "Возраст от", "age_max": "Возраст до",
+    "adult_confirmation": "Подтверждение возраста 18+",
 }
 
 
@@ -585,6 +589,8 @@ def migrate_schema(sync_conn):
         sync_conn.execute(text("ALTER TABLE events ADD COLUMN age_min INTEGER"))
     if "age_max" not in event_columns:
         sync_conn.execute(text("ALTER TABLE events ADD COLUMN age_max INTEGER"))
+    if "status_warning_sent_for" not in event_columns:
+        sync_conn.execute(text("ALTER TABLE events ADD COLUMN status_warning_sent_for VARCHAR(64)"))
     user_columns = {column["name"] for column in inspector.get_columns("users")}
     if "birth_date" not in user_columns:
         sync_conn.execute(text("ALTER TABLE users ADD COLUMN birth_date DATE"))
@@ -621,6 +627,9 @@ def migrate_schema(sync_conn):
     sync_conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_otp_codes_delivery_token ON otp_codes (delivery_token)"))
     sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_otp_codes_gateway_request_id ON otp_codes (gateway_request_id)"))
     registration_columns = {column["name"] for column in inspector.get_columns("registrations")}
+    if "adult_consent_at" not in registration_columns:
+        timestamp_type = "TIMESTAMP WITH TIME ZONE" if sync_conn.dialect.name == "postgresql" else "TIMESTAMP"
+        sync_conn.execute(text(f"ALTER TABLE registrations ADD COLUMN adult_consent_at {timestamp_type}"))
     if "reminder_24h_sent_at" not in registration_columns:
         sync_conn.execute(text("ALTER TABLE registrations ADD COLUMN reminder_24h_sent_at TIMESTAMP WITH TIME ZONE"))
     if "reminder_2h_sent_at" not in registration_columns:
@@ -644,6 +653,7 @@ async def startup():
             ])
             await db.commit()
     start_reminder_scheduler()
+    await configure_telegram_bot()
 
 
 @app.on_event("shutdown")
@@ -685,13 +695,47 @@ async def telegram_bot_request(method: str, payload: dict) -> bool:
         return False
 
 
-async def send_telegram_message(chat_id: str, message: str) -> bool:
+def telegram_reply_keyboard() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "▶️ Запустить уведомления"}],
+            [{"text": "✅ Проверить статус"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+async def configure_telegram_bot() -> None:
+    if not settings.telegram_bot_token:
+        return
+    await asyncio.gather(
+        telegram_bot_request(
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": "start", "description": "Запустить уведомления"},
+                    {"command": "status", "description": "Проверить подключение"},
+                    {"command": "stop", "description": "Остановить уведомления"},
+                ]
+            },
+        ),
+        telegram_bot_request(
+            "setChatMenuButton",
+            {"menu_button": {"type": "commands"}},
+        ),
+        return_exceptions=True,
+    )
+
+
+async def send_telegram_message(chat_id: str, message: str, reply_markup: dict | None = None) -> bool:
     return await telegram_bot_request(
         "sendMessage",
         {
             "chat_id": chat_id,
             "text": message,
             "disable_web_page_preview": True,
+            "reply_markup": reply_markup or telegram_reply_keyboard(),
         },
     )
 
@@ -724,6 +768,31 @@ def event_timezone() -> ZoneInfo:
 def reminder_event_time(event: Event) -> str:
     local_start = normalize_dt(event.starts_at).astimezone(event_timezone())
     return local_start.strftime("%d.%m.%Y в %H:%M")
+
+
+def event_status_warning(event: Event, now: datetime | None = None) -> dict | None:
+    current_time = normalize_dt(now or datetime.now(timezone.utc))
+    starts_at = normalize_dt(event.starts_at)
+    scheduled_time = reminder_event_time(event)
+    if event.status == EventStatus.registration and starts_at <= current_time:
+        return {
+            "code": "registration_after_start",
+            "title": "Проверьте статус мероприятия",
+            "body": f"По расписанию мероприятие началось {scheduled_time}, но его статус — «Регистрация». Запустите мероприятие или измените дату.",
+        }
+    if event.status == EventStatus.live and starts_at > current_time:
+        return {
+            "code": "live_before_start",
+            "title": "Проверьте статус мероприятия",
+            "body": f"Мероприятие отмечено как начавшееся, хотя по расписанию оно начнётся {scheduled_time}. Верните регистрацию или измените дату.",
+        }
+    if event.status == EventStatus.finished and starts_at > current_time:
+        return {
+            "code": "finished_before_start",
+            "title": "Проверьте статус мероприятия",
+            "body": f"Мероприятие завершено раньше даты начала — {scheduled_time}. Проверьте статус или измените дату.",
+        }
+    return None
 
 
 async def process_event_reminders(now: datetime | None = None) -> int:
@@ -777,10 +846,43 @@ async def process_event_reminders(now: datetime | None = None) -> int:
     return sent_count
 
 
+async def process_event_status_warnings(now: datetime | None = None) -> int:
+    current_time = normalize_dt(now or datetime.now(timezone.utc))
+    telegram_messages: list[tuple[User, str, str]] = []
+    sent_count = 0
+    async with Session() as db:
+        events = (
+            await db.scalars(
+                select(Event)
+                .where(Event.status != EventStatus.cancelled)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        admins = (await db.scalars(select(User).where(User.is_admin == True))).all()
+        for event in events:
+            warning = event_status_warning(event, current_time)
+            warning_code = warning["code"] if warning else None
+            if not warning:
+                if event.status_warning_sent_for is not None:
+                    event.status_warning_sent_for = None
+                continue
+            if event.status_warning_sent_for == warning_code:
+                continue
+            event.status_warning_sent_for = warning_code
+            body = f"«{event.title}»: {warning['body']}"
+            db.add(Notification(admin_only=True, title=warning["title"], body=body))
+            telegram_messages.extend((admin, warning["title"], body) for admin in admins)
+            sent_count += 1
+        await db.commit()
+    await send_user_telegram_notifications(telegram_messages)
+    return sent_count
+
+
 async def reminder_scheduler() -> None:
     while True:
         try:
             await process_event_reminders()
+            await process_event_status_warnings()
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -1252,8 +1354,8 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
     missing_fields = [label for label, value in required_fields.items() if not value]
     if missing_fields:
         raise HTTPException(400, f"Для записи заполните обязательные поля: {', '.join(missing_fields)}")
-    if not payload.personal_data_consent or not payload.prepayment_consent:
-        raise HTTPException(400, "Для записи нужны оба согласия")
+    if not payload.personal_data_consent or not payload.prepayment_consent or not payload.adult_confirmation:
+        raise HTTPException(400, "Для записи подтвердите обработку данных, предоплату и возраст 18+")
     event = await db.scalar(
         select(Event)
         .where(Event.id == event_id)
@@ -1263,6 +1365,8 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
     if not event or event.status != EventStatus.registration:
         raise HTTPException(400, "Регистрация закрыта")
     user_age = calculate_age(user.birth_date)
+    if user_age < 18:
+        raise HTTPException(403, "Регистрация доступна только пользователям старше 18 лет")
     existing = next((r for r in event.registrations if r.user_id == user.id), None)
     capacity = event.male_capacity if user.gender == Gender.male else event.female_capacity
     taken = sum(
@@ -1278,6 +1382,9 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
         if taken >= capacity:
             raise HTTPException(409, "Свободных мест пока нет. Вы уже в листе ожидания")
         existing.status = RegistrationStatus.awaiting_payment
+        existing.pdata_consent_at = now
+        existing.prepayment_consent_at = now
+        existing.adult_consent_at = now
         notification_title = "Заявка на освободившееся место отправлена"
         notification_body = (
             f"Вы откликнулись на освободившееся место на «{event.title}». "
@@ -1304,6 +1411,7 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
                 status=RegistrationStatus.waitlisted,
                 pdata_consent_at=now,
                 prepayment_consent_at=now,
+                adult_consent_at=now,
             )
         )
         db.add(Notification(admin_only=True, title="Новый участник в листе ожидания", body=f"{user.name}, {user_age} лет, встал(-а) в очередь на «{event.title}»"))
@@ -1315,7 +1423,7 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
             f"Вы успешно записались на «{event.title}». "
             "Организаторы скоро свяжутся с вами по контактам, указанным в профиле."
         )
-        db.add(Registration(event_id=event.id, user_id=user.id, pdata_consent_at=now, prepayment_consent_at=now))
+        db.add(Registration(event_id=event.id, user_id=user.id, pdata_consent_at=now, prepayment_consent_at=now, adult_consent_at=now))
         db.add(Notification(admin_only=True, title="Новая запись", body=f"{user.name}, {user_age} лет, записался(-ась) на «{event.title}»"))
     db.add(Notification(user_id=user.id, title=notification_title, body=notification_body))
     await db.commit()
@@ -1525,6 +1633,8 @@ async def telegram_webhook(
     command, _, argument = message_text.partition(" ")
     command = command.split("@", 1)[0].lower()
     argument = argument.strip()
+    launch_requested = command == "/start" or message_text == "▶️ Запустить уведомления"
+    status_requested = command == "/status" or message_text == "✅ Проверить статус"
 
     if command == "/start" and argument:
         user = await db.scalar(select(User).where(User.telegram_link_token == argument))
@@ -1561,25 +1671,37 @@ async def telegram_webhook(
         return {"ok": True}
 
     linked_user = await db.scalar(select(User).where(User.telegram_chat_id == chat_id))
-    if command == "/stop":
+    if launch_requested:
+        if linked_user:
+            linked_user.telegram_notifications_enabled = True
+            await db.commit()
+            await send_telegram_message(
+                chat_id,
+                "✅ Уведомления REALDATE запущены.\n\nТеперь мы будем присылать сюда важные сообщения о ваших мероприятиях.",
+            )
+        else:
+            await send_telegram_message(
+                chat_id,
+                "Сначала привяжите Telegram к аккаунту REALDATE. Откройте профиль или раздел уведомлений на сайте и нажмите «Подключить Telegram».",
+            )
+    elif command == "/stop":
         if linked_user:
             linked_user.telegram_notifications_enabled = False
-            linked_user.telegram_chat_id = None
             await db.commit()
         await send_telegram_message(
             chat_id,
-            "Уведомления REALDATE отключены. Подключить их снова можно на странице уведомлений сайта.",
+            "Уведомления REALDATE остановлены. Чтобы включить их снова, нажмите постоянную кнопку «Запустить уведомления» внизу чата.",
         )
-    elif command == "/status":
+    elif status_requested:
         await send_telegram_message(
             chat_id,
             "✅ Уведомления подключены." if linked_user and linked_user.telegram_notifications_enabled
-            else "Уведомления ещё не подключены. Откройте страницу уведомлений на сайте REALDATE и нажмите «Подключить Telegram».",
+            else "Уведомления сейчас не активны. Нажмите «Запустить уведомления» или подключите Telegram в профиле на сайте REALDATE.",
         )
     else:
         await send_telegram_message(
             chat_id,
-            "Это бот уведомлений REALDATE. Для подключения откройте страницу уведомлений на сайте и нажмите «Подключить Telegram».\n\n/status — проверить подключение\n/stop — отключить уведомления",
+            "Это бот уведомлений REALDATE. Используйте постоянные кнопки внизу чата. Для первой привязки откройте профиль на сайте и нажмите «Подключить Telegram».\n\n/start — запустить уведомления\n/status — проверить подключение\n/stop — остановить уведомления",
         )
     return {"ok": True}
 
@@ -1663,6 +1785,7 @@ async def admin_event(event_id: int, _: User = Depends(admin_user), db: AsyncSes
     waitlisted = [r for r in event.registrations if r.status == RegistrationStatus.waitlisted]
     data = event_json(event)
     data.update(
+        status_warning=event_status_warning(event),
         registrations=[{"id": r.id, "status": r.status, "paid": r.paid, "number": r.participant_number, "user": user_json(r.user)} for r in event.registrations],
         stats={
             "registrations": len(event.registrations),
@@ -1898,8 +2021,16 @@ async def moderate_registration(registration_id: int, paid: bool | None = None, 
         )
     )
     if not reg: raise HTTPException(404, "Регистрация не найдена")
-    if paid is not None: reg.paid = paid
     telegram_messages: list[tuple[User, str, str]] = []
+    waitlist_notified = 0
+    previous_paid = reg.paid
+    if paid is not None:
+        reg.paid = paid
+        if paid and not previous_paid:
+            title = "Оплата получена"
+            body = f"Мы получили оплату за участие в мероприятии «{reg.event.title}»."
+            db.add(Notification(user_id=reg.user_id, title=title, body=body))
+            telegram_messages.append((reg.user, title, body))
     if confirmed is not None:
         previous_status = reg.status
         if confirmed and previous_status not in ACTIVE_REGISTRATION_STATUSES:
@@ -1948,9 +2079,10 @@ async def moderate_registration(registration_id: int, paid: bool | None = None, 
                     )
                 )
                 telegram_messages.append((waiting_registration.user, waitlist_title, waitlist_body))
+                waitlist_notified += 1
     await db.commit()
     await send_user_telegram_notifications(telegram_messages)
-    return {"updated": True, "waitlist_notified": max(0, len(telegram_messages) - (1 if confirmed is not None else 0))}
+    return {"updated": True, "waitlist_notified": waitlist_notified}
 
 
 @app.patch("/api/admin/events/{event_id}/status")
@@ -1965,6 +2097,7 @@ async def change_status(event_id: int, status: EventStatus, _: User = Depends(ad
     }
     if status not in allowed[event.status]: raise HTTPException(400, "Недопустимый переход статуса")
     telegram_messages: list[tuple[User, str, str]] = []
+    previous_status = event.status
     if status == EventStatus.live:
         for gender in Gender:
             regs = [r for r in event.registrations if r.status == RegistrationStatus.confirmed and r.user.gender == gender]
@@ -1976,11 +2109,33 @@ async def change_status(event_id: int, status: EventStatus, _: User = Depends(ad
                 for reg, number in zip(regs, numbers):
                     reg.participant_number = number
     event.status = status
-    if status == EventStatus.finished:
+    event.status_warning_sent_for = None
+    if status == EventStatus.live and previous_status == EventStatus.registration:
         for reg in event.registrations:
             if reg.status == RegistrationStatus.confirmed:
-                title = "Результаты готовы"
-                body = f"Посмотрите совпадения после «{event.title}»."
+                title = "Мероприятие началось"
+                number_text = f" Ваш номер — № {reg.participant_number}." if reg.participant_number else ""
+                body = f"«{event.title}» началось.{number_text} Откройте мероприятие на сайте, чтобы увидеть участников и отметить симпатии."
+                db.add(Notification(user_id=reg.user_id, title=title, body=body))
+                telegram_messages.append((reg.user, title, body))
+    if status == EventStatus.finished:
+        like_rows = (await db.scalars(select(Like).where(Like.event_id == event.id, Like.liked == True))).all()
+        positive_likes = {(like.from_user_id, like.to_user_id) for like in like_rows}
+        for reg in event.registrations:
+            if reg.status == RegistrationStatus.confirmed:
+                match_count = sum(
+                    other.status == RegistrationStatus.confirmed
+                    and other.user.gender != reg.user.gender
+                    and (reg.user_id, other.user_id) in positive_likes
+                    and (other.user_id, reg.user_id) in positive_likes
+                    for other in event.registrations
+                )
+                title = "Результаты и взаимные симпатии"
+                if match_count:
+                    ending = "совпадение" if match_count == 1 else "совпадения" if 2 <= match_count <= 4 else "совпадений"
+                    body = f"После «{event.title}» у вас {match_count} взаимных {ending}. Контакты уже доступны в результатах мероприятия."
+                else:
+                    body = f"Результаты «{event.title}» опубликованы. Взаимных симпатий на этот раз нет."
                 db.add(Notification(user_id=reg.user_id, title=title, body=body))
                 telegram_messages.append((reg.user, title, body))
     await db.commit()

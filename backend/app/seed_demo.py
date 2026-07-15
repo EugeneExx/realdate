@@ -137,6 +137,7 @@ async def add_registration(
         participant_number=number,
         pdata_consent_at=now,
         prepayment_consent_at=now,
+        adult_consent_at=now,
     )
     session.add(registration)
     await session.flush()

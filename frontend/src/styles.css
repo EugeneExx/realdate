@@ -14,6 +14,150 @@
   font-synthesis: none;
 }
 
+/* 18+ confirmation */
+.age-gate-screen,
+.age-gate-screen *,
+.age-gate-screen *::before,
+.age-gate-screen *::after {
+  box-sizing: border-box;
+}
+.age-gate-screen {
+  min-height: 100svh;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background:
+    radial-gradient(circle at 15% 15%, rgba(232, 217, 193, 0.23), transparent 28%),
+    radial-gradient(circle at 85% 80%, rgba(232, 217, 193, 0.14), transparent 32%),
+    var(--wine);
+}
+.age-gate-card {
+  width: min(560px, 100%);
+  padding: 42px;
+  border: 1px solid rgba(232, 217, 193, 0.8);
+  border-radius: 22px;
+  background: var(--paper);
+  box-shadow: 0 28px 80px rgba(24, 0, 5, 0.35);
+  text-align: center;
+}
+.age-gate-brand {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 6px;
+  margin-bottom: 28px;
+  color: var(--wine);
+  white-space: nowrap;
+}
+.age-gate-brand b {
+  font-family: Prata, Georgia, serif;
+  font-size: 25px;
+  font-weight: 400;
+  letter-spacing: 0.14em;
+}
+.age-gate-brand small {
+  padding-bottom: 2px;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+}
+.age-gate-badge {
+  width: max-content;
+  max-width: 100%;
+  margin: 0 auto 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--wine);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.age-gate-badge svg {
+  width: 18px;
+  height: 18px;
+}
+.age-gate-card h1 {
+  margin-bottom: 14px;
+  font-size: clamp(36px, 6vw, 50px);
+  line-height: 1.08;
+}
+.age-gate-card > p {
+  max-width: 440px;
+  margin: 0 auto 28px;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.7;
+}
+.age-gate-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.age-gate-accept,
+.age-gate-decline {
+  min-height: 50px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 11px;
+  padding: 13px 18px;
+  font-weight: 800;
+  transition: transform 0.2s, box-shadow 0.2s, background 0.2s;
+}
+.age-gate-accept {
+  border: 1px solid var(--wine);
+  background: var(--wine);
+  color: white;
+  box-shadow: 0 9px 22px rgba(88, 0, 15, 0.2);
+}
+.age-gate-accept:hover {
+  background: var(--wine-2);
+  transform: translateY(-1px);
+}
+.age-gate-decline {
+  border: 1px solid var(--line);
+  background: white;
+  color: var(--ink);
+}
+.age-gate-decline:hover {
+  border-color: #c8b8b2;
+  background: #faf6f2;
+}
+.age-gate-note {
+  display: block;
+  margin-top: 17px;
+  color: #988b8d;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.age-gate-links {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.age-gate-links a:hover {
+  color: var(--wine);
+}
+.age-restricted-card .age-gate-accept {
+  width: 100%;
+}
+.age-gate-reset {
+  margin-top: 18px;
+  border: 0;
+  background: transparent;
+  color: var(--wine);
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 /* Public storefront and legal pages */
 .public-site {
   min-height: 100vh;
@@ -1116,6 +1260,32 @@
 .status-error {
   margin: -18px 0 28px;
 }
+.event-status-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+  margin: -12px 0 28px;
+  padding: 16px 18px;
+  border: 1px solid #e6c98d;
+  border-radius: 12px;
+  background: #fff8e8;
+  color: #6e4c08;
+}
+.event-status-warning > svg {
+  width: 21px;
+  height: 21px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.event-status-warning b {
+  display: block;
+  margin-bottom: 4px;
+  color: #503600;
+}
+.event-status-warning p {
+  margin: 0;
+  line-height: 1.45;
+}
 .danger-button {
   border: 1px solid #ddb9bd;
   border-radius: 10px;
@@ -2027,6 +2197,23 @@
   color: #725f64;
   font-size: 10px;
 }
+.public-footer-developer {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px 8px;
+  text-align: center;
+}
+.public-footer-developer a {
+  color: #cdbcc0;
+  text-decoration: none;
+}
+.public-footer-developer a:hover {
+  color: var(--cream);
+}
+.developer-contact-cards {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
 .public-document {
   min-height: 65vh;
   padding: 64px 0 90px;
@@ -2457,6 +2644,13 @@
   }
   .public-footer-bottom {
     flex-direction: column;
+  }
+  .public-footer-developer {
+    justify-content: flex-start;
+    text-align: left;
+  }
+  .developer-contact-cards {
+    grid-template-columns: 1fr;
   }
   .public-document {
     padding: 42px 0 65px;
@@ -5337,5 +5531,39 @@ select:focus {
   }
   .bottom-nav a span {
     display: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .age-gate-screen {
+    place-items: start center;
+    padding: 14px;
+  }
+  .age-gate-card {
+    margin-block: auto;
+    padding: 30px 20px 24px;
+    border-radius: 18px;
+  }
+  .age-gate-brand {
+    margin-bottom: 20px;
+  }
+  .age-gate-card h1 {
+    font-size: 36px;
+  }
+  .age-gate-card > p {
+    margin-bottom: 22px;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  .age-gate-actions {
+    grid-template-columns: 1fr;
+  }
+  .age-gate-accept,
+  .age-gate-decline {
+    min-height: 48px;
+  }
+  .age-gate-links {
+    margin-top: 18px;
+    padding-top: 17px;
   }
 }

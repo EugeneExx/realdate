@@ -105,7 +105,14 @@ export const api = {
   },
   events: () => request<Event[]>("/events"),
   event: (id: number) => request<Event>(`/events/${id}`),
-  register: (id: number) =>
+  register: (
+    id: number,
+    consents: {
+      personal_data_consent: boolean;
+      prepayment_consent: boolean;
+      adult_confirmation: boolean;
+    },
+  ) =>
     request<{
       registered: boolean;
       waitlisted: boolean;
@@ -113,10 +120,7 @@ export const api = {
       notification: { title: string; body: string };
     }>(`/events/${id}/register`, {
       method: "POST",
-      body: JSON.stringify({
-        personal_data_consent: true,
-        prepayment_consent: true,
-      }),
+      body: JSON.stringify(consents),
     }),
   like: (id: number, target_user_id: number, liked: boolean) =>
     request(`/events/${id}/like`, {
@@ -323,6 +327,11 @@ export type AdminQuiz = QuizEditorPayload & {
   participants: AdminQuizParticipant[];
 };
 export type AdminEvent = Event & {
+  status_warning?: {
+    code: string;
+    title: string;
+    body: string;
+  } | null;
   registrations: AdminRegistration[];
   stats: {
     registrations: number;

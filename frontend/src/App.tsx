@@ -9,6 +9,7 @@ import {
   useParams,
 } from "react-router-dom";
 import {
+  AlertTriangle,
   Bell,
   Award,
   CakeSlice,
@@ -55,6 +56,84 @@ import {
 } from "./api";
 import PublicSite, { PublicDocumentPage } from "./PublicSite";
 import { publicConfig } from "./public-config";
+
+type AgeDecision = "adult" | "underage" | null;
+
+const AGE_CONFIRMATION_COOKIE = "realdate_age_confirmation";
+const PUBLIC_LEGAL_PATHS = new Set([
+  "/offer",
+  "/privacy",
+  "/personal-data-consent",
+  "/payment-and-refund",
+  "/contacts",
+]);
+
+const readAgeDecision = (): AgeDecision => {
+  const value = document.cookie
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${AGE_CONFIRMATION_COOKIE}=`))
+    ?.split("=")[1];
+  return value === "adult" || value === "underage" ? value : null;
+};
+
+const saveAgeDecision = (decision: Exclude<AgeDecision, null>) => {
+  const secure = window.location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = `${AGE_CONFIRMATION_COOKIE}=${decision}; Max-Age=31536000; Path=/; SameSite=Lax${secure}`;
+};
+
+function AgeGate({ onDecision }: { onDecision: (decision: Exclude<AgeDecision, null>) => void }) {
+  return (
+    <main className="age-gate-screen">
+      <section className="age-gate-card" role="dialog" aria-modal="true" aria-labelledby="age-gate-title">
+        <div className="age-gate-brand" aria-label="REALDATE quickly">
+          <b>REALDATE</b>
+          <small>quickly</small>
+        </div>
+        <div className="age-gate-badge"><ShieldCheck /><span>Только для совершеннолетних</span></div>
+        <h1 id="age-gate-title">Подтвердите возраст</h1>
+        <p>Сайт предназначен для лиц старше 18 лет. Подтвердите, что вам исполнилось 18 лет.</p>
+        <div className="age-gate-actions">
+          <button type="button" className="age-gate-accept" onClick={() => onDecision("adult")}>
+            Мне исполнилось 18 лет
+          </button>
+          <button type="button" className="age-gate-decline" onClick={() => onDecision("underage")}>
+            Мне нет 18 лет
+          </button>
+        </div>
+        <small className="age-gate-note">Ответ сохраняется в cookie на этом устройстве.</small>
+        <nav className="age-gate-links" aria-label="Юридические документы">
+          <NavLink to="/privacy">Конфиденциальность</NavLink>
+          <NavLink to="/offer">Публичная оферта</NavLink>
+          <NavLink to="/contacts">Контакты</NavLink>
+        </nav>
+      </section>
+    </main>
+  );
+}
+
+function AgeRestricted({ onReset }: { onReset: () => void }) {
+  return (
+    <main className="age-gate-screen">
+      <section className="age-gate-card age-restricted-card">
+        <div className="age-gate-brand" aria-label="REALDATE quickly">
+          <b>REALDATE</b>
+          <small>quickly</small>
+        </div>
+        <div className="age-gate-badge"><ShieldCheck /><span>Ограничение 18+</span></div>
+        <h1>Доступ ограничен</h1>
+        <p>Регистрация, просмотр мероприятий и участие в них доступны только пользователям, которым исполнилось 18 лет.</p>
+        <NavLink className="age-gate-accept" to="/contacts">Контакты организатора</NavLink>
+        <nav className="age-gate-links" aria-label="Юридические документы">
+          <NavLink to="/privacy">Конфиденциальность</NavLink>
+          <NavLink to="/offer">Публичная оферта</NavLink>
+          <NavLink to="/payment-and-refund">Оплата и возврат</NavLink>
+        </nav>
+        <button type="button" className="age-gate-reset" onClick={onReset}>Изменить ответ</button>
+      </section>
+    </main>
+  );
+}
 
 const apiOrigin = (() => {
   const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
@@ -710,7 +789,7 @@ function EventPage() {
   const [event, setEvent] = useState<Event>();
   const [modal, setModal] = useState(false);
   const [successNotice, setSuccessNotice] = useState<{ title: string; body: string } | null>(null);
-  const [agree, setAgree] = useState([false, false]);
+  const [agree, setAgree] = useState({ personal: false, prepayment: false, adult: false });
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const load = () => api.event(Number(id)).then(setEvent);
@@ -725,9 +804,13 @@ function EventPage() {
     try {
       setError("");
       setSubmitting(true);
-      const result = await api.register(event!.id);
+      const result = await api.register(event!.id, {
+        personal_data_consent: agree.personal,
+        prepayment_consent: agree.prepayment,
+        adult_confirmation: agree.adult,
+      });
       setModal(false);
-      setAgree([false, false]);
+      setAgree({ personal: false, prepayment: false, adult: false });
       setSuccessNotice(result.notification);
       window.dispatchEvent(new CustomEvent(NOTIFICATIONS_CHANGED_EVENT));
       void load();
@@ -898,8 +981,8 @@ function EventPage() {
             <label className="check">
               <input
                 type="checkbox"
-                checked={agree[0]}
-                onChange={(e) => setAgree([e.target.checked, agree[1]])}
+                checked={agree.personal}
+                onChange={(e) => setAgree((current) => ({ ...current, personal: e.target.checked }))}
               />
               <span>
                 Я принимаю{" "}
@@ -919,8 +1002,8 @@ function EventPage() {
             <label className="check">
               <input
                 type="checkbox"
-                checked={agree[1]}
-                onChange={(e) => setAgree([agree[0], e.target.checked])}
+                checked={agree.prepayment}
+                onChange={(e) => setAgree((current) => ({ ...current, prepayment: e.target.checked }))}
               />
               <span>
                 Я согласен(на) внести полную предоплату {money(event.price)}
@@ -931,10 +1014,18 @@ function EventPage() {
                 </NavLink>
               </span>
             </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={agree.adult}
+                onChange={(e) => setAgree((current) => ({ ...current, adult: e.target.checked }))}
+              />
+              <span>Подтверждаю, что мне исполнилось 18 лет, и указанные в профиле данные достоверны.</span>
+            </label>
             {error && <div className="error">{error}</div>}
             <button
               className="primary wide"
-              disabled={!agree.every(Boolean) || submitting}
+              disabled={!Object.values(agree).every(Boolean) || submitting}
               onClick={register}
             >
               {submitting
@@ -1222,6 +1313,100 @@ function Participants({ event, reload }: { event: Event; reload: () => void }) {
   );
 }
 
+function TelegramNotificationCard() {
+  const [telegramStatus, setTelegramStatus] = useState<
+    Awaited<ReturnType<typeof api.telegramStatus>> | null
+  >(null);
+  const [telegramPending, setTelegramPending] = useState(false);
+  const [telegramBusy, setTelegramBusy] = useState(false);
+  const [telegramError, setTelegramError] = useState("");
+  const refreshTelegramStatus = () =>
+    api.telegramStatus().then((status) => {
+      setTelegramStatus(status);
+      if (status.connected) setTelegramPending(false);
+    });
+
+  useEffect(() => {
+    void refreshTelegramStatus();
+    const refresh = () => void refreshTelegramStatus();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+
+  useEffect(() => {
+    if (!telegramPending) return;
+    const interval = window.setInterval(() => void refreshTelegramStatus(), 2500);
+    return () => window.clearInterval(interval);
+  }, [telegramPending]);
+
+  async function connectTelegram() {
+    setTelegramError("");
+    setTelegramBusy(true);
+    const popup = window.open("", "_blank");
+    try {
+      const result = await api.createTelegramLink();
+      if (popup) {
+        popup.opener = null;
+        popup.location.href = result.url;
+      } else {
+        window.location.href = result.url;
+      }
+      setTelegramPending(true);
+    } catch (e) {
+      popup?.close();
+      setTelegramError(e instanceof Error ? e.message : "Не удалось открыть Telegram");
+    } finally {
+      setTelegramBusy(false);
+    }
+  }
+
+  async function disconnectTelegram() {
+    setTelegramError("");
+    setTelegramBusy(true);
+    try {
+      await api.disconnectTelegram();
+      await refreshTelegramStatus();
+    } catch (e) {
+      setTelegramError(e instanceof Error ? e.message : "Не удалось отключить Telegram");
+    } finally {
+      setTelegramBusy(false);
+    }
+  }
+
+  return (
+    <section className={`telegram-notification-card ${telegramStatus?.connected ? "connected" : ""}`}>
+      <div className="telegram-notification-icon">
+        {telegramStatus?.connected ? <Check /> : <Send />}
+      </div>
+      <div className="telegram-notification-copy">
+        <h3>{telegramStatus?.connected ? "Telegram подключён" : "Уведомления в Telegram"}</h3>
+        <p>
+          {telegramStatus?.connected
+            ? `Бот @${telegramStatus.bot_username} будет присылать важные сообщения о мероприятиях.`
+            : telegramPending
+              ? "Откройте Telegram и нажмите Start. Статус обновится автоматически."
+              : "Получайте подтверждения записи, напоминания и результаты прямо в Telegram."}
+        </p>
+        {telegramError && <small className="telegram-notification-error">{telegramError}</small>}
+      </div>
+      {telegramStatus?.connected ? (
+        <button type="button" className="secondary" disabled={telegramBusy} onClick={disconnectTelegram}>
+          Отключить
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="primary"
+          disabled={telegramBusy || telegramPending || telegramStatus?.configured === false}
+          onClick={connectTelegram}
+        >
+          {telegramPending ? "Ждём Start…" : telegramBusy ? "Открываем…" : "Подключить Telegram"}
+        </button>
+      )}
+    </section>
+  );
+}
+
 function Profile({
   user,
   setUser,
@@ -1301,6 +1486,7 @@ function Profile({
         eyebrow="Личный кабинет"
         title="Ваш профиль"
       />
+      <TelegramNotificationCard />
       <form className="profile-layout" onSubmit={submit} noValidate>
         <div className="photo-editor">
           <div
@@ -1552,17 +1738,6 @@ function Notices() {
   const [items, setItems] = useState<
     Awaited<ReturnType<typeof api.notifications>>
   >([]);
-  const [telegramStatus, setTelegramStatus] = useState<
-    Awaited<ReturnType<typeof api.telegramStatus>> | null
-  >(null);
-  const [telegramPending, setTelegramPending] = useState(false);
-  const [telegramBusy, setTelegramBusy] = useState(false);
-  const [telegramError, setTelegramError] = useState("");
-  const refreshTelegramStatus = () =>
-    api.telegramStatus().then((status) => {
-      setTelegramStatus(status);
-      if (status.connected) setTelegramPending(false);
-    });
   useEffect(() => {
     let active = true;
     api.notifications().then((notices) => {
@@ -1578,82 +1753,10 @@ function Notices() {
       active = false;
     };
   }, []);
-  useEffect(() => {
-    void refreshTelegramStatus();
-    const refresh = () => void refreshTelegramStatus();
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
-  }, []);
-  useEffect(() => {
-    if (!telegramPending) return;
-    const interval = window.setInterval(() => void refreshTelegramStatus(), 2500);
-    return () => window.clearInterval(interval);
-  }, [telegramPending]);
-  async function connectTelegram() {
-    setTelegramError("");
-    setTelegramBusy(true);
-    const popup = window.open("", "_blank");
-    try {
-      const result = await api.createTelegramLink();
-      if (popup) {
-        popup.opener = null;
-        popup.location.href = result.url;
-      } else {
-        window.location.href = result.url;
-      }
-      setTelegramPending(true);
-    } catch (e) {
-      popup?.close();
-      setTelegramError(e instanceof Error ? e.message : "Не удалось открыть Telegram");
-    } finally {
-      setTelegramBusy(false);
-    }
-  }
-  async function disconnectTelegram() {
-    setTelegramError("");
-    setTelegramBusy(true);
-    try {
-      await api.disconnectTelegram();
-      await refreshTelegramStatus();
-    } catch (e) {
-      setTelegramError(e instanceof Error ? e.message : "Не удалось отключить Telegram");
-    } finally {
-      setTelegramBusy(false);
-    }
-  }
   return (
     <div className="page narrow">
       <PageHead eyebrow="Будьте в курсе" title="Уведомления" />
-      <section className={`telegram-notification-card ${telegramStatus?.connected ? "connected" : ""}`}>
-        <div className="telegram-notification-icon">
-          {telegramStatus?.connected ? <Check /> : <Send />}
-        </div>
-        <div className="telegram-notification-copy">
-          <h3>{telegramStatus?.connected ? "Telegram подключён" : "Уведомления в Telegram"}</h3>
-          <p>
-            {telegramStatus?.connected
-              ? `Бот @${telegramStatus.bot_username} будет присылать важные сообщения о мероприятиях.`
-              : telegramPending
-                ? "Откройте Telegram и нажмите Start. Статус обновится автоматически."
-                : "Получайте подтверждения записи, напоминания и результаты прямо в Telegram."}
-          </p>
-          {telegramError && <small className="telegram-notification-error">{telegramError}</small>}
-        </div>
-        {telegramStatus?.connected ? (
-          <button type="button" className="secondary" disabled={telegramBusy} onClick={disconnectTelegram}>
-            Отключить
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="primary"
-            disabled={telegramBusy || telegramPending || telegramStatus?.configured === false}
-            onClick={connectTelegram}
-          >
-            {telegramPending ? "Ждём Start…" : telegramBusy ? "Открываем…" : "Подключить Telegram"}
-          </button>
-        )}
-      </section>
+      <TelegramNotificationCard />
       <div className="notice-list">
         {items.length ? (
           items.map((n) => (
@@ -2523,6 +2626,15 @@ function AdminEventPage() {
         }
       />
       {statusError && <div className="error status-error">{statusError}</div>}
+      {event.status_warning && (
+        <div className="event-status-warning" role="alert">
+          <AlertTriangle aria-hidden="true" />
+          <div>
+            <b>{event.status_warning.title}</b>
+            <p>{event.status_warning.body}</p>
+          </div>
+        </div>
+      )}
       <div className="stats">
         <div>
           <Users />
@@ -2761,6 +2873,7 @@ function Loader() {
 
 export default function App() {
   const location = useLocation();
+  const [ageDecision, setAgeDecision] = useState<AgeDecision>(readAgeDecision);
   const [user, setUser] = useState<User | null | undefined>(undefined);
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -2776,6 +2889,27 @@ export default function App() {
         });
     else setUser(null);
   }, []);
+  if (ageDecision !== "adult" && PUBLIC_LEGAL_PATHS.has(location.pathname)) return <PublicSite />;
+  if (ageDecision === null) {
+    return (
+      <AgeGate
+        onDecision={(decision) => {
+          saveAgeDecision(decision);
+          setAgeDecision(decision);
+        }}
+      />
+    );
+  }
+  if (ageDecision === "underage") {
+    return (
+      <AgeRestricted
+        onReset={() => {
+          document.cookie = `${AGE_CONFIRMATION_COOKIE}=; Max-Age=0; Path=/; SameSite=Lax`;
+          setAgeDecision(null);
+        }}
+      />
+    );
+  }
   if (user === undefined) return <Loader />;
   if (!user && location.pathname === "/login") {
     return <Auth onDone={setUser} />;
