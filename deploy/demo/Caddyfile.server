@@ -1,0 +1,39 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$DOMAIN}, www.{$DOMAIN} {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        -Server
+    }
+
+    reverse_proxy /api/* api:8000
+    reverse_proxy /uploads/* api:8000
+    reverse_proxy /health api:8000
+    reverse_proxy web:80
+}
+
+realdate-demo-201-51-31-172.nip.io {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        -Server
+    }
+
+    reverse_proxy /api/* realdate-demo-api:8000
+    reverse_proxy /uploads/* realdate-demo-api:8000
+    reverse_proxy /health realdate-demo-api:8000
+    reverse_proxy realdate-demo-web:80
+}

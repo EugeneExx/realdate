@@ -150,9 +150,18 @@ async def seed(participant_phone: str) -> None:
         users = await get_or_create_demo_users(session)
         participant = await session.scalar(select(User).where(User.phone == participant_phone))
         if participant is None:
-            raise RuntimeError(f"Пользователь {participant_phone} не найден")
-        if not participant.name or not participant.gender:
-            raise RuntimeError(f"Сначала заполните имя и пол профиля {participant_phone}")
+            participant = User(phone=participant_phone)
+            session.add(participant)
+        participant.name = participant.name or "Екатерина"
+        participant.gender = participant.gender or Gender.female
+        participant.birth_date = participant.birth_date or date(1992, 5, 18)
+        participant.bio = participant.bio or "Люблю живые встречи, путешествия и хорошие разговоры."
+        participant.telegram = participant.telegram or "@katy_sha_00"
+        participant.whatsapp = participant.whatsapp or participant_phone
+        participant.email = participant.email or "demo@realdate.local"
+        participant.photo_url = participant.photo_url or write_avatar(participant_phone, "#7A1730", "ЕК")
+        participant.is_admin = True
+        await session.flush()
 
         open_event = Event(
             title=f"{DEMO_PREFIX} Запись открыта — свободные места",
