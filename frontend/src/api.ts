@@ -73,12 +73,27 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   publicEvents: () => request<Event[]>("/public/events"),
   requestCode: (phone: string) =>
-    request<{ sent: boolean; dev_code?: string }>("/auth/request-code", {
+    request<{
+      sent: boolean;
+      channel: string;
+      status_token?: string;
+      delivery_status?: OtpDeliveryStatus;
+      dev_code?: string;
+    }>("/auth/request-code", {
       method: "POST",
       body: JSON.stringify({ phone }),
     }),
+  codeStatus: (statusToken: string) =>
+    request<{ status: OtpDeliveryStatus; expires_at: string }>(
+      `/auth/code-status/${encodeURIComponent(statusToken)}`,
+    ),
   verify: (phone: string, code: string) =>
     request<{ access_token: string; user: User }>("/auth/verify", {
+      method: "POST",
+      body: JSON.stringify({ phone, code }),
+    }),
+  verifyEventCode: (phone: string, code: string) =>
+    request<{ access_token: string; user: User }>("/auth/event-code/verify", {
       method: "POST",
       body: JSON.stringify({ phone, code }),
     }),
@@ -95,7 +110,14 @@ export const api = {
   },
   events: () => request<Event[]>("/events"),
   event: (id: number) => request<Event>(`/events/${id}`),
-  register: (id: number) =>
+  register: (
+    id: number,
+    consents: {
+      personal_data_consent: boolean;
+      prepayment_consent: boolean;
+      adult_confirmation: boolean;
+    },
+  ) =>
     request<{
       registered: boolean;
       waitlisted: boolean;
@@ -103,10 +125,7 @@ export const api = {
       notification: { title: string; body: string };
     }>(`/events/${id}/register`, {
       method: "POST",
-      body: JSON.stringify({
-        personal_data_consent: true,
-        prepayment_consent: true,
-      }),
+      body: JSON.stringify(consents),
     }),
   like: (id: number, target_user_id: number, liked: boolean) =>
     request(`/events/${id}/like`, {
@@ -135,6 +154,12 @@ export const api = {
       body: JSON.stringify(data),
     }),
   adminEvent: (id: number) => request<AdminEvent>(`/admin/events/${id}`),
+  generateEventAccessCode: (id: number) =>
+    request<{ code: string; active: boolean; created_at: string }>(`/admin/events/${id}/access-code`, {
+      method: "POST",
+    }),
+  disableEventAccessCode: (id: number) =>
+    request<{ active: boolean }>(`/admin/events/${id}/access-code`, { method: "DELETE" }),
   adminQuiz: (id: number) => request<AdminQuiz>(`/admin/events/${id}/quiz`),
   uploadQuizImage: (id: number, file: File) => {
     const form = new FormData();
@@ -160,6 +185,7 @@ export const api = {
 };
 
 export type Gender = "male" | "female";
+export type OtpDeliveryStatus = "pending" | "sent" | "delivered" | "read" | "expired" | "revoked" | "failed";
 export type User = {
   id: number;
   phone: string;
@@ -312,6 +338,15 @@ export type AdminQuiz = QuizEditorPayload & {
   participants: AdminQuizParticipant[];
 };
 export type AdminEvent = Event & {
+  status_warning?: {
+    code: string;
+    title: string;
+    body: string;
+  } | null;
+  event_access: {
+    active: boolean;
+    created_at?: string;
+  };
   registrations: AdminRegistration[];
   stats: {
     registrations: number;

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
+import logging
 import os
 import random
 import re
@@ -38,6 +40,12 @@ class Settings(BaseSettings):
     otp_provider: str = "console"
     telegram_gateway_token: str | None = None
     telegram_sender_username: str | None = None
+    telegram_gateway_callback_url: str | None = None
+    telegram_gateway_low_balance_threshold: Decimal = Decimal("1.00")
+    otp_ip_hourly_limit: int = 30
+    otp_phone_hourly_limit: int = 5
+    otp_resend_seconds: int = 60
+    event_access_attempt_limit: int = 10
     telegram_bot_token: str | None = None
     telegram_bot_username: str | None = None
     telegram_bot_webhook_secret: str | None = None
@@ -49,17 +57,23 @@ class Settings(BaseSettings):
     admin_phone: str = "+79990000000"
     admin_phones: str = ""
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    event_timezone: str = "Asia/Vladivostok"
+    event_timezone: str = "Asia/Khabarovsk"
 
 
 settings = Settings()
 reminder_task: asyncio.Task[None] | None = None
+logger = logging.getLogger("realdate")
 
 
 def configured_admin_phones() -> set[str]:
     phones = {settings.admin_phone.strip()} if settings.admin_phone.strip() else set()
     phones.update(phone.strip() for phone in settings.admin_phones.split(",") if phone.strip())
     return phones
+
+
+def client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return forwarded or (request.client.host if request.client else None)
 
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
@@ -137,6 +151,24 @@ class OtpCode(Base):
     used: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     request_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivery_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    gateway_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    gateway_delivery_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gateway_verification_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gateway_request_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    gateway_remaining_balance: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    gateway_is_refunded: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    gateway_error: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class EventAccessAttempt(Base):
+    __tablename__ = "event_access_attempts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone: Mapped[str] = mapped_column(String(24), index=True)
+    request_ip: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 class Event(Base):
@@ -153,6 +185,9 @@ class Event(Base):
     age_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
     age_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[EventStatus] = mapped_column(SAEnum(EventStatus), default=EventStatus.registration)
+    status_warning_sent_for: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    access_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    access_code_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     registrations: Mapped[list[Registration]] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True)
     quiz: Mapped[Quiz | None] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True, uselist=False, lazy="selectin")
@@ -168,6 +203,7 @@ class Registration(Base):
     paid: Mapped[bool] = mapped_column(Boolean, default=False)
     pdata_consent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     prepayment_consent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    adult_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     participant_number: Mapped[int | None] = mapped_column(Integer)
     reminder_24h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reminder_2h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -289,6 +325,17 @@ class VerifyIn(PhoneIn):
     code: str = Field(min_length=4, max_length=6)
 
 
+class EventAccessVerifyIn(PhoneIn):
+    code: str = Field(min_length=6, max_length=6)
+
+    @field_validator("code")
+    @classmethod
+    def digits_only(cls, value: str) -> str:
+        if not value.isdigit():
+            raise ValueError("Код мероприятия должен состоять из шести цифр")
+        return value
+
+
 class ProfileIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -374,6 +421,7 @@ class EventIn(BaseModel):
 class RegistrationIn(BaseModel):
     personal_data_consent: bool
     prepayment_consent: bool
+    adult_confirmation: bool
 
 
 class LikeIn(BaseModel):
@@ -431,13 +479,21 @@ def normalize_dt(value: datetime) -> datetime:
 
 
 def calculate_age(birth_date: date) -> int:
-    today = date.today()
+    today = datetime.now(event_timezone()).date()
     return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
 
 
 def token_for(user: User) -> str:
     payload = {"sub": str(user.id), "exp": datetime.now(timezone.utc) + timedelta(days=settings.jwt_expire_days)}
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def event_access_code_hash(event_id: int, code: str) -> str:
+    return hmac.new(
+        settings.jwt_secret.encode(),
+        f"event:{event_id}:{code}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 async def current_user(authorization: Annotated[str | None, Header()] = None, db: AsyncSession = Depends(get_db)) -> User:
@@ -529,6 +585,7 @@ FIELD_NAMES = {
     "starts_at": "Дата и время", "venue": "Площадка", "address": "Адрес",
     "price": "Стоимость", "male_capacity": "Мест для мужчин",
     "female_capacity": "Мест для девушек", "age_min": "Возраст от", "age_max": "Возраст до",
+    "adult_confirmation": "Подтверждение возраста 18+",
 }
 
 
@@ -568,6 +625,13 @@ def migrate_schema(sync_conn):
         sync_conn.execute(text("ALTER TABLE events ADD COLUMN age_min INTEGER"))
     if "age_max" not in event_columns:
         sync_conn.execute(text("ALTER TABLE events ADD COLUMN age_max INTEGER"))
+    if "status_warning_sent_for" not in event_columns:
+        sync_conn.execute(text("ALTER TABLE events ADD COLUMN status_warning_sent_for VARCHAR(64)"))
+    if "access_code_hash" not in event_columns:
+        sync_conn.execute(text("ALTER TABLE events ADD COLUMN access_code_hash VARCHAR(64)"))
+    if "access_code_created_at" not in event_columns:
+        timestamp_type = "TIMESTAMP WITH TIME ZONE" if sync_conn.dialect.name == "postgresql" else "TIMESTAMP"
+        sync_conn.execute(text(f"ALTER TABLE events ADD COLUMN access_code_created_at {timestamp_type}"))
     user_columns = {column["name"] for column in inspector.get_columns("users")}
     if "birth_date" not in user_columns:
         sync_conn.execute(text("ALTER TABLE users ADD COLUMN birth_date DATE"))
@@ -587,7 +651,26 @@ def migrate_schema(sync_conn):
         sync_conn.execute(text("UPDATE otp_codes SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
     if "request_ip" not in otp_columns:
         sync_conn.execute(text("ALTER TABLE otp_codes ADD COLUMN request_ip VARCHAR(64)"))
+    otp_additions = {
+        "delivery_token": "VARCHAR(64)",
+        "gateway_request_id": "VARCHAR(128)",
+        "gateway_delivery_status": "VARCHAR(32)",
+        "gateway_verification_status": "VARCHAR(64)",
+        "gateway_request_cost": "NUMERIC(12, 6)",
+        "gateway_remaining_balance": "NUMERIC(12, 6)",
+        "gateway_is_refunded": "BOOLEAN",
+        "gateway_error": "VARCHAR(160)",
+        "verified_at": "TIMESTAMP WITH TIME ZONE" if sync_conn.dialect.name == "postgresql" else "TIMESTAMP",
+    }
+    for column_name, column_type in otp_additions.items():
+        if column_name not in otp_columns:
+            sync_conn.execute(text(f"ALTER TABLE otp_codes ADD COLUMN {column_name} {column_type}"))
+    sync_conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_otp_codes_delivery_token ON otp_codes (delivery_token)"))
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_otp_codes_gateway_request_id ON otp_codes (gateway_request_id)"))
     registration_columns = {column["name"] for column in inspector.get_columns("registrations")}
+    if "adult_consent_at" not in registration_columns:
+        timestamp_type = "TIMESTAMP WITH TIME ZONE" if sync_conn.dialect.name == "postgresql" else "TIMESTAMP"
+        sync_conn.execute(text(f"ALTER TABLE registrations ADD COLUMN adult_consent_at {timestamp_type}"))
     if "reminder_24h_sent_at" not in registration_columns:
         sync_conn.execute(text("ALTER TABLE registrations ADD COLUMN reminder_24h_sent_at TIMESTAMP WITH TIME ZONE"))
     if "reminder_2h_sent_at" not in registration_columns:
@@ -606,11 +689,12 @@ async def startup():
             await db.commit()
         if not (await db.scalar(select(Event.id).limit(1))):
             db.add_all([
-                Event(title="Вечер быстрых знакомств", description="Камерный вечер в центре города: 8 коротких встреч, лёгкая музыка и welcome drink.", starts_at=datetime.now(timezone.utc) + timedelta(days=6, hours=3), venue="Бар «Север»", address="ул. Светланская, 33", price=2500, male_capacity=8, female_capacity=8, age_min=25, age_max=40),
-                Event(title="Знакомства & вино", description="Неспешный формат для тех, кто ценит живой разговор и хорошую атмосферу.", starts_at=datetime.now(timezone.utc) + timedelta(days=14, hours=1), venue="Винный зал Blanc", address="Океанский проспект, 17", price=3200, male_capacity=10, female_capacity=10, age_min=30, age_max=45),
+                Event(title="Вечер быстрых знакомств", description="Камерный вечер в центре Хабаровска: 8 коротких встреч, лёгкая музыка и welcome drink.", starts_at=datetime.now(timezone.utc) + timedelta(days=6, hours=3), venue="Бар «Север»", address="ул. Муравьёва-Амурского, 33", price=2500, male_capacity=8, female_capacity=8, age_min=25, age_max=40),
+                Event(title="Знакомства & вино", description="Неспешный формат для тех, кто ценит живой разговор и хорошую атмосферу.", starts_at=datetime.now(timezone.utc) + timedelta(days=14, hours=1), venue="Винный зал Blanc", address="Амурский бульвар, 17", price=3200, male_capacity=10, female_capacity=10, age_min=30, age_max=45),
             ])
             await db.commit()
     start_reminder_scheduler()
+    await configure_telegram_bot()
 
 
 @app.on_event("shutdown")
@@ -652,13 +736,47 @@ async def telegram_bot_request(method: str, payload: dict) -> bool:
         return False
 
 
-async def send_telegram_message(chat_id: str, message: str) -> bool:
+def telegram_reply_keyboard() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "▶️ Запустить уведомления"}],
+            [{"text": "✅ Проверить статус"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+async def configure_telegram_bot() -> None:
+    if not settings.telegram_bot_token:
+        return
+    await asyncio.gather(
+        telegram_bot_request(
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": "start", "description": "Запустить уведомления"},
+                    {"command": "status", "description": "Проверить подключение"},
+                    {"command": "stop", "description": "Остановить уведомления"},
+                ]
+            },
+        ),
+        telegram_bot_request(
+            "setChatMenuButton",
+            {"menu_button": {"type": "commands"}},
+        ),
+        return_exceptions=True,
+    )
+
+
+async def send_telegram_message(chat_id: str, message: str, reply_markup: dict | None = None) -> bool:
     return await telegram_bot_request(
         "sendMessage",
         {
             "chat_id": chat_id,
             "text": message,
             "disable_web_page_preview": True,
+            "reply_markup": reply_markup or telegram_reply_keyboard(),
         },
     )
 
@@ -691,6 +809,31 @@ def event_timezone() -> ZoneInfo:
 def reminder_event_time(event: Event) -> str:
     local_start = normalize_dt(event.starts_at).astimezone(event_timezone())
     return local_start.strftime("%d.%m.%Y в %H:%M")
+
+
+def event_status_warning(event: Event, now: datetime | None = None) -> dict | None:
+    current_time = normalize_dt(now or datetime.now(timezone.utc))
+    starts_at = normalize_dt(event.starts_at)
+    scheduled_time = reminder_event_time(event)
+    if event.status == EventStatus.registration and starts_at <= current_time:
+        return {
+            "code": "registration_after_start",
+            "title": "Проверьте статус мероприятия",
+            "body": f"По расписанию мероприятие началось {scheduled_time}, но его статус — «Регистрация». Запустите мероприятие или измените дату.",
+        }
+    if event.status == EventStatus.live and starts_at > current_time:
+        return {
+            "code": "live_before_start",
+            "title": "Проверьте статус мероприятия",
+            "body": f"Мероприятие отмечено как начавшееся, хотя по расписанию оно начнётся {scheduled_time}. Верните регистрацию или измените дату.",
+        }
+    if event.status == EventStatus.finished and starts_at > current_time:
+        return {
+            "code": "finished_before_start",
+            "title": "Проверьте статус мероприятия",
+            "body": f"Мероприятие завершено раньше даты начала — {scheduled_time}. Проверьте статус или измените дату.",
+        }
+    return None
 
 
 async def process_event_reminders(now: datetime | None = None) -> int:
@@ -744,10 +887,43 @@ async def process_event_reminders(now: datetime | None = None) -> int:
     return sent_count
 
 
+async def process_event_status_warnings(now: datetime | None = None) -> int:
+    current_time = normalize_dt(now or datetime.now(timezone.utc))
+    telegram_messages: list[tuple[User, str, str]] = []
+    sent_count = 0
+    async with Session() as db:
+        events = (
+            await db.scalars(
+                select(Event)
+                .where(Event.status != EventStatus.cancelled)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        admins = (await db.scalars(select(User).where(User.is_admin == True))).all()
+        for event in events:
+            warning = event_status_warning(event, current_time)
+            warning_code = warning["code"] if warning else None
+            if not warning:
+                if event.status_warning_sent_for is not None:
+                    event.status_warning_sent_for = None
+                continue
+            if event.status_warning_sent_for == warning_code:
+                continue
+            event.status_warning_sent_for = warning_code
+            body = f"«{event.title}»: {warning['body']}"
+            db.add(Notification(admin_only=True, title=warning["title"], body=body))
+            telegram_messages.extend((admin, warning["title"], body) for admin in admins)
+            sent_count += 1
+        await db.commit()
+    await send_user_telegram_notifications(telegram_messages)
+    return sent_count
+
+
 async def reminder_scheduler() -> None:
     while True:
         try:
             await process_event_reminders()
+            await process_event_status_warnings()
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -761,28 +937,134 @@ def start_reminder_scheduler() -> None:
         reminder_task = asyncio.create_task(reminder_scheduler())
 
 
-async def deliver_otp(phone: str, code: str, request_ip: str | None = None) -> None:
+class GatewayDeliveryError(Exception):
+    def __init__(self, code: str, public_message: str, status_code: int = 502):
+        super().__init__(public_message)
+        self.code = code[:160]
+        self.public_message = public_message
+        self.status_code = status_code
+
+
+def gateway_error_details(data: object, status_code: int) -> tuple[str, str]:
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        error_code = str(error.get("code") or error.get("type") or status_code)
+        error_text = str(error.get("message") or error.get("description") or error_code)
+    else:
+        error_code = str(status_code)
+        error_text = str(error or "Telegram Gateway rejected the request")
+    searchable = f"{error_code} {error_text}".lower()
+    if any(word in searchable for word in ("balance", "credit", "fund", "payment")):
+        public = "На балансе Telegram Gateway недостаточно средств. Сообщите администратору"
+    elif any(word in searchable for word in ("phone", "number", "recipient", "registered")):
+        public = "Этот номер сейчас недоступен для получения кода через Telegram. Проверьте номер и аккаунт Telegram"
+    elif any(word in searchable for word in ("token", "unauthorized", "forbidden", "access")):
+        public = "Сервис Telegram Gateway временно не настроен. Сообщите администратору"
+    elif any(word in searchable for word in ("sender", "channel")):
+        public = "Отправитель Telegram Gateway настроен неверно. Сообщите администратору"
+    else:
+        public = "Telegram не смог отправить код. Попробуйте позже"
+    return error_code[:160], public
+
+
+async def telegram_gateway_call(method: str, payload: dict) -> dict:
+    if not settings.telegram_gateway_token:
+        raise GatewayDeliveryError("not_configured", "Telegram Gateway не настроен", 500)
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.post(
+                f"https://gatewayapi.telegram.org/{method}",
+                headers={"Authorization": f"Bearer {settings.telegram_gateway_token}"},
+                json=payload,
+            )
+        data = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Telegram Gateway %s unavailable: %s", method, type(error).__name__)
+        raise GatewayDeliveryError(
+            "gateway_unavailable",
+            "Telegram Gateway временно недоступен. Попробуйте ещё раз",
+            503,
+        ) from error
+    if response.status_code >= 400 or not isinstance(data, dict) or not data.get("ok"):
+        internal_error, public_error = gateway_error_details(data, response.status_code)
+        logger.warning("Telegram Gateway %s rejected request: HTTP %s, code %s", method, response.status_code, internal_error)
+        raise GatewayDeliveryError(internal_error, public_error)
+    result = data.get("result")
+    if not isinstance(result, dict):
+        raise GatewayDeliveryError("invalid_response", "Telegram Gateway вернул некорректный ответ. Попробуйте позже")
+    return result
+
+
+def nested_status(result: dict, field: str) -> str | None:
+    value = result.get(field)
+    if isinstance(value, dict):
+        status = value.get("status")
+        return str(status) if status else None
+    return str(value) if value else None
+
+
+def optional_decimal(value: object) -> Decimal | None:
+    try:
+        return Decimal(str(value)) if value is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def apply_gateway_status(otp: OtpCode, result: dict) -> None:
+    request_id = result.get("request_id")
+    if request_id:
+        otp.gateway_request_id = str(request_id)[:128]
+    new_delivery_status = nested_status(result, "delivery_status")
+    status_rank = {"pending": 0, "sent": 1, "delivered": 2, "read": 3, "expired": 4, "revoked": 4, "failed": 4}
+    if new_delivery_status and status_rank.get(new_delivery_status, 0) >= status_rank.get(otp.gateway_delivery_status or "pending", 0):
+        otp.gateway_delivery_status = new_delivery_status[:32]
+    verification_status = nested_status(result, "verification_status")
+    if verification_status:
+        otp.gateway_verification_status = verification_status[:64]
+    request_cost = optional_decimal(result.get("request_cost"))
+    remaining_balance = optional_decimal(result.get("remaining_balance"))
+    if request_cost is not None:
+        otp.gateway_request_cost = request_cost
+    if remaining_balance is not None:
+        otp.gateway_remaining_balance = remaining_balance
+    if result.get("is_refunded") is not None:
+        otp.gateway_is_refunded = bool(result.get("is_refunded"))
+
+
+async def deliver_otp(
+    phone: str,
+    code: str,
+    request_ip: str | None = None,
+    delivery_token: str | None = None,
+) -> dict:
     provider = settings.otp_provider.lower()
     if provider == "console":
         print(f"REALDATE OTP for {phone}: {code}")
-        return
+        return {"delivery_status": {"status": "sent"}}
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             if provider == "telegram":
-                if not settings.telegram_gateway_token:
-                    raise HTTPException(500, "Telegram Gateway не настроен")
-                payload = {"phone_number": phone, "code": code, "ttl": 300}
+                if not settings.telegram_gateway_callback_url:
+                    raise GatewayDeliveryError(
+                        "callback_not_configured",
+                        "Callback Telegram Gateway не настроен. Сообщите администратору",
+                        500,
+                    )
+                ability = await telegram_gateway_call("checkSendAbility", {"phone_number": phone})
+                request_id = ability.get("request_id")
+                if not request_id:
+                    raise GatewayDeliveryError("missing_request_id", "Telegram Gateway вернул некорректный ответ. Попробуйте позже")
+                payload = {
+                    "phone_number": phone,
+                    "code": code,
+                    "ttl": 300,
+                    "request_id": request_id,
+                    "callback_url": settings.telegram_gateway_callback_url,
+                    "payload": delivery_token,
+                }
                 if settings.telegram_sender_username:
                     payload["sender_username"] = settings.telegram_sender_username
-                response = await client.post(
-                    "https://gatewayapi.telegram.org/sendVerificationMessage",
-                    headers={"Authorization": f"Bearer {settings.telegram_gateway_token}"},
-                    json=payload,
-                )
-                data = response.json()
-                if response.status_code >= 400 or not data.get("ok"):
-                    raise HTTPException(502, "Не удалось отправить код через Telegram. Попробуйте позже")
-                return
+                return await telegram_gateway_call("sendVerificationMessage", payload)
             if provider == "smsru":
                 if not settings.smsru_api_id:
                     raise HTTPException(500, "SMS.ru не настроен")
@@ -801,7 +1083,7 @@ async def deliver_otp(phone: str, code: str, request_ip: str | None = None) -> N
                 sms_status = (data.get("sms") or {}).get(phone.lstrip("+"), {})
                 if response.status_code >= 400 or data.get("status") != "OK" or sms_status.get("status") != "OK":
                     raise HTTPException(502, "Не удалось отправить SMS-код. Проверьте баланс и настройки SMS.ru")
-                return
+                return {"delivery_status": {"status": "sent"}}
             if provider == "smsaero":
                 if not settings.smsaero_email or not settings.smsaero_api_key:
                     raise HTTPException(500, "SMS Aero не настроен")
@@ -817,7 +1099,9 @@ async def deliver_otp(phone: str, code: str, request_ip: str | None = None) -> N
                 data = response.json()
                 if response.status_code >= 400 or not data.get("success"):
                     raise HTTPException(502, "Не удалось отправить SMS-код через SMS Aero. Проверьте баланс и имя отправителя")
-                return
+                return {"delivery_status": {"status": "sent"}}
+    except GatewayDeliveryError:
+        raise
     except HTTPException:
         raise
     except (httpx.HTTPError, ValueError):
@@ -825,11 +1109,28 @@ async def deliver_otp(phone: str, code: str, request_ip: str | None = None) -> N
     raise HTTPException(500, "Неизвестный OTP-провайдер")
 
 
+async def add_low_gateway_balance_notification(db: AsyncSession, balance: Decimal | None) -> None:
+    if balance is None or balance >= settings.telegram_gateway_low_balance_threshold:
+        return
+    recent = await db.scalar(
+        select(Notification.id).where(
+            Notification.admin_only == True,
+            Notification.title == "Низкий баланс Telegram Gateway",
+            Notification.created_at >= datetime.now(timezone.utc) - timedelta(hours=6),
+        ).limit(1)
+    )
+    if not recent:
+        db.add(Notification(
+            admin_only=True,
+            title="Низкий баланс Telegram Gateway",
+            body=f"Остаток баланса: {balance}. Пополните его, чтобы авторизация продолжала работать.",
+        ))
+
+
 @app.post("/api/auth/request-code")
 async def request_code(payload: PhoneIn, request: Request, db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    request_ip = forwarded or (request.client.host if request.client else None)
+    request_ip = client_ip(request)
     if request_ip:
         hourly_requests = await db.scalar(
             select(func.count(OtpCode.id)).where(
@@ -837,17 +1138,132 @@ async def request_code(payload: PhoneIn, request: Request, db: AsyncSession = De
                 OtpCode.created_at >= now - timedelta(hours=1),
             )
         )
-        if (hourly_requests or 0) >= 10:
+        if (hourly_requests or 0) >= settings.otp_ip_hourly_limit:
             raise HTTPException(429, "Превышен лимит запросов кодов. Попробуйте через час")
-    latest = await db.scalar(select(OtpCode).where(OtpCode.phone == payload.phone).order_by(OtpCode.id.desc()).limit(1))
-    if latest and latest.created_at and now - normalize_dt(latest.created_at) < timedelta(seconds=60):
-        raise HTTPException(429, "Новый код можно запросить через 60 секунд")
+    phone_requests = await db.scalar(
+        select(func.count(OtpCode.id)).where(
+            OtpCode.phone == payload.phone,
+            OtpCode.created_at >= now - timedelta(hours=1),
+            or_(OtpCode.gateway_delivery_status.is_(None), OtpCode.gateway_delivery_status != "failed"),
+        )
+    )
+    if (phone_requests or 0) >= settings.otp_phone_hourly_limit:
+        raise HTTPException(429, "Для этого номера превышен лимит кодов. Попробуйте через час")
+    latest = await db.scalar(
+        select(OtpCode).where(
+            OtpCode.phone == payload.phone,
+            or_(OtpCode.gateway_delivery_status.is_(None), OtpCode.gateway_delivery_status != "failed"),
+        ).order_by(OtpCode.id.desc()).limit(1)
+    )
+    if latest and latest.created_at and now - normalize_dt(latest.created_at) < timedelta(seconds=settings.otp_resend_seconds):
+        raise HTTPException(429, f"Новый код можно запросить через {settings.otp_resend_seconds} секунд")
     code = "1111" if settings.otp_provider == "console" else f"{secrets.randbelow(10000):04d}"
-    await deliver_otp(payload.phone, code, request_ip)
     await db.execute(update(OtpCode).where(OtpCode.phone == payload.phone, OtpCode.used == False).values(used=True))
-    db.add(OtpCode(phone=payload.phone, code_hash=hashlib.sha256((code + settings.jwt_secret).encode()).hexdigest(), expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), request_ip=request_ip))
+    delivery_token = secrets.token_urlsafe(24)
+    otp = OtpCode(
+        phone=payload.phone,
+        code_hash=hashlib.sha256((code + settings.jwt_secret).encode()).hexdigest(),
+        expires_at=now + timedelta(minutes=5),
+        request_ip=request_ip,
+        delivery_token=delivery_token,
+        gateway_delivery_status="pending",
+    )
+    db.add(otp)
     await db.commit()
-    return {"sent": True, "channel": settings.otp_provider, "dev_code": code if settings.otp_provider == "console" else None}
+    try:
+        delivery_result = await deliver_otp(payload.phone, code, request_ip, delivery_token)
+    except GatewayDeliveryError as error:
+        await db.refresh(otp)
+        otp.gateway_delivery_status = "failed"
+        otp.gateway_error = error.code
+        otp.used = True
+        await db.commit()
+        raise HTTPException(error.status_code, error.public_message) from error
+    except HTTPException:
+        await db.refresh(otp)
+        otp.gateway_delivery_status = "failed"
+        otp.used = True
+        await db.commit()
+        raise
+    except Exception as error:
+        await db.refresh(otp)
+        otp.gateway_delivery_status = "failed"
+        otp.gateway_error = "unexpected_delivery_error"
+        otp.used = True
+        await db.commit()
+        logger.exception("Unexpected OTP delivery error: %s", type(error).__name__)
+        raise HTTPException(503, "Сервис отправки кодов временно недоступен. Попробуйте ещё раз") from error
+    await db.refresh(otp)
+    apply_gateway_status(otp, delivery_result)
+    await add_low_gateway_balance_notification(db, otp.gateway_remaining_balance)
+    await db.commit()
+    return {
+        "sent": True,
+        "channel": settings.otp_provider,
+        "status_token": delivery_token,
+        "delivery_status": otp.gateway_delivery_status or "sent",
+        "dev_code": code if settings.otp_provider == "console" else None,
+    }
+
+
+def verify_gateway_callback_signature(timestamp: str, signature: str, body: bytes) -> bool:
+    if not settings.telegram_gateway_token:
+        return False
+    try:
+        timestamp_value = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(datetime.now(timezone.utc).timestamp()) - timestamp_value) > 300:
+        return False
+    secret_key = hashlib.sha256(settings.telegram_gateway_token.encode()).digest()
+    expected = hmac.new(secret_key, timestamp.encode() + b"\n" + body, hashlib.sha256).hexdigest()
+    return secrets.compare_digest(expected, signature.lower())
+
+
+@app.post("/api/auth/telegram-gateway/callback")
+async def telegram_gateway_callback(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.body()
+    timestamp = request.headers.get("x-request-timestamp", "")
+    signature = request.headers.get("x-request-signature", "")
+    if not verify_gateway_callback_signature(timestamp, signature, body):
+        raise HTTPException(403, "Некорректная подпись callback")
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(400, "Некорректный callback")
+    result = data.get("result", data) if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        raise HTTPException(400, "Некорректный callback")
+    payload_token = result.get("payload")
+    request_id = result.get("request_id")
+    otp = None
+    if payload_token:
+        otp = await db.scalar(select(OtpCode).where(OtpCode.delivery_token == str(payload_token)))
+    if not otp and request_id:
+        otp = await db.scalar(select(OtpCode).where(OtpCode.gateway_request_id == str(request_id)).order_by(OtpCode.id.desc()))
+    if otp:
+        apply_gateway_status(otp, result)
+        if otp.gateway_delivery_status in {"expired", "revoked", "failed"}:
+            otp.used = True
+        await add_low_gateway_balance_notification(db, otp.gateway_remaining_balance)
+        await db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/auth/code-status/{status_token}")
+async def code_status(status_token: str, db: AsyncSession = Depends(get_db)):
+    if len(status_token) < 20 or len(status_token) > 64:
+        raise HTTPException(404, "Запрос кода не найден")
+    otp = await db.scalar(select(OtpCode).where(OtpCode.delivery_token == status_token))
+    if not otp:
+        raise HTTPException(404, "Запрос кода не найден")
+    status = otp.gateway_delivery_status or "pending"
+    if normalize_dt(otp.expires_at) < datetime.now(timezone.utc) and status in {"pending", "sent"}:
+        status = "expired"
+        otp.gateway_delivery_status = status
+        otp.used = True
+        await db.commit()
+    return {"status": status, "expires_at": normalize_dt(otp.expires_at).isoformat()}
 
 
 @app.post("/api/auth/verify")
@@ -861,6 +1277,18 @@ async def verify(payload: VerifyIn, db: AsyncSession = Depends(get_db)):
         await db.commit()
         raise HTTPException(400, "Неверный код")
     otp.used = True
+    otp.verified_at = datetime.now(timezone.utc)
+    if settings.otp_provider.lower() == "telegram" and otp.gateway_request_id:
+        try:
+            gateway_result = await telegram_gateway_call(
+                "checkVerificationStatus",
+                {"request_id": otp.gateway_request_id, "code": payload.code},
+            )
+            apply_gateway_status(otp, gateway_result)
+            await add_low_gateway_balance_notification(db, otp.gateway_remaining_balance)
+        except GatewayDeliveryError as error:
+            otp.gateway_error = error.code
+            logger.warning("Telegram Gateway verification status was not recorded: %s", error.code)
     user = await db.scalar(select(User).where(User.phone == payload.phone))
     if not user:
         user = User(phone=payload.phone, is_admin=payload.phone in configured_admin_phones())
@@ -870,6 +1298,75 @@ async def verify(payload: VerifyIn, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(user)
     return {"access_token": token_for(user), "user": user_json(user, private=True)}
+
+
+@app.post("/api/auth/event-code/verify")
+async def verify_event_access_code(
+    payload: EventAccessVerifyIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    request_ip = client_ip(request)
+    recent_since = now - timedelta(minutes=15)
+    await db.execute(
+        delete(EventAccessAttempt).where(
+            EventAccessAttempt.created_at < now - timedelta(days=30)
+        )
+    )
+    attempt_scope = EventAccessAttempt.phone == payload.phone
+    if request_ip:
+        attempt_scope = or_(
+            attempt_scope,
+            EventAccessAttempt.request_ip == request_ip,
+        )
+    failed_attempts = await db.scalar(
+        select(func.count(EventAccessAttempt.id)).where(
+            EventAccessAttempt.success == False,
+            EventAccessAttempt.created_at >= recent_since,
+            attempt_scope,
+        )
+    )
+    if (failed_attempts or 0) >= settings.event_access_attempt_limit:
+        raise HTTPException(429, "Слишком много попыток. Повторите вход через 15 минут")
+
+    candidates = (
+        await db.execute(
+            select(Event, User)
+            .join(Registration, Registration.event_id == Event.id)
+            .join(User, User.id == Registration.user_id)
+            .where(
+                User.phone == payload.phone,
+                Registration.status == RegistrationStatus.confirmed,
+                Event.status == EventStatus.live,
+                Event.access_code_hash.is_not(None),
+            )
+        )
+    ).all()
+    authenticated_user: User | None = None
+    for event, user in candidates:
+        expected = event_access_code_hash(event.id, payload.code)
+        if event.access_code_hash and secrets.compare_digest(event.access_code_hash, expected):
+            authenticated_user = user
+            break
+
+    db.add(
+        EventAccessAttempt(
+            phone=payload.phone,
+            request_ip=request_ip,
+            success=authenticated_user is not None,
+        )
+    )
+    await db.commit()
+    if not authenticated_user:
+        raise HTTPException(
+            400,
+            "Код недействителен. Проверьте код, статус мероприятия и подтверждение вашей заявки",
+        )
+    return {
+        "access_token": token_for(authenticated_user),
+        "user": user_json(authenticated_user, private=True),
+    }
 
 
 @app.get("/api/me")
@@ -966,8 +1463,8 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
     missing_fields = [label for label, value in required_fields.items() if not value]
     if missing_fields:
         raise HTTPException(400, f"Для записи заполните обязательные поля: {', '.join(missing_fields)}")
-    if not payload.personal_data_consent or not payload.prepayment_consent:
-        raise HTTPException(400, "Для записи нужны оба согласия")
+    if not payload.personal_data_consent or not payload.prepayment_consent or not payload.adult_confirmation:
+        raise HTTPException(400, "Для записи подтвердите обработку данных, предоплату и возраст 18+")
     event = await db.scalar(
         select(Event)
         .where(Event.id == event_id)
@@ -977,6 +1474,8 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
     if not event or event.status != EventStatus.registration:
         raise HTTPException(400, "Регистрация закрыта")
     user_age = calculate_age(user.birth_date)
+    if user_age < 18:
+        raise HTTPException(403, "Регистрация доступна только пользователям старше 18 лет")
     existing = next((r for r in event.registrations if r.user_id == user.id), None)
     capacity = event.male_capacity if user.gender == Gender.male else event.female_capacity
     taken = sum(
@@ -992,6 +1491,9 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
         if taken >= capacity:
             raise HTTPException(409, "Свободных мест пока нет. Вы уже в листе ожидания")
         existing.status = RegistrationStatus.awaiting_payment
+        existing.pdata_consent_at = now
+        existing.prepayment_consent_at = now
+        existing.adult_consent_at = now
         notification_title = "Заявка на освободившееся место отправлена"
         notification_body = (
             f"Вы откликнулись на освободившееся место на «{event.title}». "
@@ -1018,6 +1520,7 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
                 status=RegistrationStatus.waitlisted,
                 pdata_consent_at=now,
                 prepayment_consent_at=now,
+                adult_consent_at=now,
             )
         )
         db.add(Notification(admin_only=True, title="Новый участник в листе ожидания", body=f"{user.name}, {user_age} лет, встал(-а) в очередь на «{event.title}»"))
@@ -1029,7 +1532,7 @@ async def register(event_id: int, payload: RegistrationIn, user: User = Depends(
             f"Вы успешно записались на «{event.title}». "
             "Организаторы скоро свяжутся с вами по контактам, указанным в профиле."
         )
-        db.add(Registration(event_id=event.id, user_id=user.id, pdata_consent_at=now, prepayment_consent_at=now))
+        db.add(Registration(event_id=event.id, user_id=user.id, pdata_consent_at=now, prepayment_consent_at=now, adult_consent_at=now))
         db.add(Notification(admin_only=True, title="Новая запись", body=f"{user.name}, {user_age} лет, записался(-ась) на «{event.title}»"))
     db.add(Notification(user_id=user.id, title=notification_title, body=notification_body))
     await db.commit()
@@ -1239,6 +1742,8 @@ async def telegram_webhook(
     command, _, argument = message_text.partition(" ")
     command = command.split("@", 1)[0].lower()
     argument = argument.strip()
+    launch_requested = command == "/start" or message_text == "▶️ Запустить уведомления"
+    status_requested = command == "/status" or message_text == "✅ Проверить статус"
 
     if command == "/start" and argument:
         user = await db.scalar(select(User).where(User.telegram_link_token == argument))
@@ -1275,25 +1780,37 @@ async def telegram_webhook(
         return {"ok": True}
 
     linked_user = await db.scalar(select(User).where(User.telegram_chat_id == chat_id))
-    if command == "/stop":
+    if launch_requested:
+        if linked_user:
+            linked_user.telegram_notifications_enabled = True
+            await db.commit()
+            await send_telegram_message(
+                chat_id,
+                "✅ Уведомления REALDATE запущены.\n\nТеперь мы будем присылать сюда важные сообщения о ваших мероприятиях.",
+            )
+        else:
+            await send_telegram_message(
+                chat_id,
+                "Сначала привяжите Telegram к аккаунту REALDATE. Откройте профиль или раздел уведомлений на сайте и нажмите «Подключить Telegram».",
+            )
+    elif command == "/stop":
         if linked_user:
             linked_user.telegram_notifications_enabled = False
-            linked_user.telegram_chat_id = None
             await db.commit()
         await send_telegram_message(
             chat_id,
-            "Уведомления REALDATE отключены. Подключить их снова можно на странице уведомлений сайта.",
+            "Уведомления REALDATE остановлены. Чтобы включить их снова, нажмите постоянную кнопку «Запустить уведомления» внизу чата.",
         )
-    elif command == "/status":
+    elif status_requested:
         await send_telegram_message(
             chat_id,
             "✅ Уведомления подключены." if linked_user and linked_user.telegram_notifications_enabled
-            else "Уведомления ещё не подключены. Откройте страницу уведомлений на сайте REALDATE и нажмите «Подключить Telegram».",
+            else "Уведомления сейчас не активны. Нажмите «Запустить уведомления» или подключите Telegram в профиле на сайте REALDATE.",
         )
     else:
         await send_telegram_message(
             chat_id,
-            "Это бот уведомлений REALDATE. Для подключения откройте страницу уведомлений на сайте и нажмите «Подключить Telegram».\n\n/status — проверить подключение\n/stop — отключить уведомления",
+            "Это бот уведомлений REALDATE. Используйте постоянные кнопки внизу чата. Для первой привязки откройте профиль на сайте и нажмите «Подключить Telegram».\n\n/start — запустить уведомления\n/status — проверить подключение\n/stop — остановить уведомления",
         )
     return {"ok": True}
 
@@ -1377,6 +1894,11 @@ async def admin_event(event_id: int, _: User = Depends(admin_user), db: AsyncSes
     waitlisted = [r for r in event.registrations if r.status == RegistrationStatus.waitlisted]
     data = event_json(event)
     data.update(
+        status_warning=event_status_warning(event),
+        event_access={
+            "active": event.status == EventStatus.live and bool(event.access_code_hash),
+            "created_at": event.access_code_created_at,
+        },
         registrations=[{"id": r.id, "status": r.status, "paid": r.paid, "number": r.participant_number, "user": user_json(r.user)} for r in event.registrations],
         stats={
             "registrations": len(event.registrations),
@@ -1389,6 +1911,43 @@ async def admin_event(event_id: int, _: User = Depends(admin_user), db: AsyncSes
         sympathies={"matches": matches, "one_sided": one_sided},
     )
     return data
+
+
+@app.post("/api/admin/events/{event_id}/access-code")
+async def generate_event_access_code(
+    event_id: int,
+    _: User = Depends(admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    event = await db.get(Event, event_id)
+    if not event:
+        raise HTTPException(404, "Мероприятие не найдено")
+    if event.status != EventStatus.live:
+        raise HTTPException(400, "Резервный код можно создать только во время мероприятия")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    event.access_code_hash = event_access_code_hash(event.id, code)
+    event.access_code_created_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {
+        "code": code,
+        "active": True,
+        "created_at": event.access_code_created_at,
+    }
+
+
+@app.delete("/api/admin/events/{event_id}/access-code")
+async def disable_event_access_code(
+    event_id: int,
+    _: User = Depends(admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    event = await db.get(Event, event_id)
+    if not event:
+        raise HTTPException(404, "Мероприятие не найдено")
+    event.access_code_hash = None
+    event.access_code_created_at = None
+    await db.commit()
+    return {"active": False}
 
 
 @app.get("/api/admin/events/{event_id}/quiz")
@@ -1612,8 +2171,16 @@ async def moderate_registration(registration_id: int, paid: bool | None = None, 
         )
     )
     if not reg: raise HTTPException(404, "Регистрация не найдена")
-    if paid is not None: reg.paid = paid
     telegram_messages: list[tuple[User, str, str]] = []
+    waitlist_notified = 0
+    previous_paid = reg.paid
+    if paid is not None:
+        reg.paid = paid
+        if paid and not previous_paid:
+            title = "Оплата получена"
+            body = f"Мы получили оплату за участие в мероприятии «{reg.event.title}»."
+            db.add(Notification(user_id=reg.user_id, title=title, body=body))
+            telegram_messages.append((reg.user, title, body))
     if confirmed is not None:
         previous_status = reg.status
         if confirmed and previous_status not in ACTIVE_REGISTRATION_STATUSES:
@@ -1662,9 +2229,10 @@ async def moderate_registration(registration_id: int, paid: bool | None = None, 
                     )
                 )
                 telegram_messages.append((waiting_registration.user, waitlist_title, waitlist_body))
+                waitlist_notified += 1
     await db.commit()
     await send_user_telegram_notifications(telegram_messages)
-    return {"updated": True, "waitlist_notified": max(0, len(telegram_messages) - (1 if confirmed is not None else 0))}
+    return {"updated": True, "waitlist_notified": waitlist_notified}
 
 
 @app.patch("/api/admin/events/{event_id}/status")
@@ -1679,6 +2247,7 @@ async def change_status(event_id: int, status: EventStatus, _: User = Depends(ad
     }
     if status not in allowed[event.status]: raise HTTPException(400, "Недопустимый переход статуса")
     telegram_messages: list[tuple[User, str, str]] = []
+    previous_status = event.status
     if status == EventStatus.live:
         for gender in Gender:
             regs = [r for r in event.registrations if r.status == RegistrationStatus.confirmed and r.user.gender == gender]
@@ -1690,11 +2259,36 @@ async def change_status(event_id: int, status: EventStatus, _: User = Depends(ad
                 for reg, number in zip(regs, numbers):
                     reg.participant_number = number
     event.status = status
-    if status == EventStatus.finished:
+    event.status_warning_sent_for = None
+    if status != EventStatus.live:
+        event.access_code_hash = None
+        event.access_code_created_at = None
+    if status == EventStatus.live and previous_status == EventStatus.registration:
         for reg in event.registrations:
             if reg.status == RegistrationStatus.confirmed:
-                title = "Результаты готовы"
-                body = f"Посмотрите совпадения после «{event.title}»."
+                title = "Мероприятие началось"
+                number_text = f" Ваш номер — № {reg.participant_number}." if reg.participant_number else ""
+                body = f"«{event.title}» началось.{number_text} Откройте мероприятие на сайте, чтобы увидеть участников и отметить симпатии."
+                db.add(Notification(user_id=reg.user_id, title=title, body=body))
+                telegram_messages.append((reg.user, title, body))
+    if status == EventStatus.finished:
+        like_rows = (await db.scalars(select(Like).where(Like.event_id == event.id, Like.liked == True))).all()
+        positive_likes = {(like.from_user_id, like.to_user_id) for like in like_rows}
+        for reg in event.registrations:
+            if reg.status == RegistrationStatus.confirmed:
+                match_count = sum(
+                    other.status == RegistrationStatus.confirmed
+                    and other.user.gender != reg.user.gender
+                    and (reg.user_id, other.user_id) in positive_likes
+                    and (other.user_id, reg.user_id) in positive_likes
+                    for other in event.registrations
+                )
+                title = "Результаты и взаимные симпатии"
+                if match_count:
+                    ending = "совпадение" if match_count == 1 else "совпадения" if 2 <= match_count <= 4 else "совпадений"
+                    body = f"После «{event.title}» у вас {match_count} взаимных {ending}. Контакты уже доступны в результатах мероприятия."
+                else:
+                    body = f"Результаты «{event.title}» опубликованы. Взаимных симпатий на этот раз нет."
                 db.add(Notification(user_id=reg.user_id, title=title, body=body))
                 telegram_messages.append((reg.user, title, body))
     await db.commit()

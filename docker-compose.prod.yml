@@ -23,6 +23,11 @@ services:
       OTP_PROVIDER: ${OTP_PROVIDER}
       TELEGRAM_GATEWAY_TOKEN: ${TELEGRAM_GATEWAY_TOKEN:-}
       TELEGRAM_SENDER_USERNAME: ${TELEGRAM_SENDER_USERNAME:-}
+      TELEGRAM_GATEWAY_CALLBACK_URL: ${TELEGRAM_GATEWAY_CALLBACK_URL:-}
+      TELEGRAM_GATEWAY_LOW_BALANCE_THRESHOLD: ${TELEGRAM_GATEWAY_LOW_BALANCE_THRESHOLD:-1.00}
+      OTP_IP_HOURLY_LIMIT: ${OTP_IP_HOURLY_LIMIT:-30}
+      OTP_PHONE_HOURLY_LIMIT: ${OTP_PHONE_HOURLY_LIMIT:-5}
+      OTP_RESEND_SECONDS: ${OTP_RESEND_SECONDS:-60}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
       TELEGRAM_BOT_WEBHOOK_SECRET: ${TELEGRAM_BOT_WEBHOOK_SECRET:-}
@@ -34,7 +39,7 @@ services:
       ADMIN_PHONE: ${ADMIN_PHONE}
       ADMIN_PHONES: ${ADMIN_PHONES:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://${DOMAIN}}
-      EVENT_TIMEZONE: ${EVENT_TIMEZONE:-Asia/Vladivostok}
+      EVENT_TIMEZONE: ${EVENT_TIMEZONE:-Asia/Khabarovsk}
       UPLOAD_DIR: /app/uploads
     volumes:
       - uploads:/app/uploads
@@ -46,6 +51,10 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+    networks:
+      default:
+        aliases:
+          - realdate-main-api
 
   web:
     build:
@@ -65,6 +74,10 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - realdate-main-web
 
   caddy:
     image: caddy:2.10-alpine

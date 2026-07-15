@@ -26,7 +26,7 @@ services:
       ADMIN_PHONE: ${ADMIN_PHONE}
       ADMIN_PHONES: ${ADMIN_PHONES}
       CORS_ORIGINS: https://${DEMO_DOMAIN}
-      EVENT_TIMEZONE: Asia/Vladivostok
+      EVENT_TIMEZONE: Asia/Khabarovsk
       UPLOAD_DIR: /app/uploads
     volumes:
       - uploads:/app/uploads
