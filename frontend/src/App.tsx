@@ -190,7 +190,7 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
       if (step === 1) {
         const data = await api.requestCode(fullPhone);
         setStep(2);
-        if (data.dev_code)
+        if (import.meta.env.DEV && data.dev_code)
           setHint(`Код для локального запуска: ${data.dev_code}`);
       } else {
         const data = await api.verify(fullPhone, code);
