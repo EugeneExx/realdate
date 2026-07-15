@@ -1,3 +1,5 @@
+name: realdate-demo
+
 services:
   db:
     image: postgres:16-alpine
@@ -20,17 +22,11 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
-      OTP_PROVIDER: ${OTP_PROVIDER:-telegram}
-      TELEGRAM_GATEWAY_TOKEN: ${TELEGRAM_GATEWAY_TOKEN:-}
-      TELEGRAM_SENDER_USERNAME: ${TELEGRAM_SENDER_USERNAME:-}
-      SMSRU_API_ID: ${SMSRU_API_ID:-}
-      SMSRU_FROM: ${SMSRU_FROM:-}
-      SMSAERO_EMAIL: ${SMSAERO_EMAIL:-}
-      SMSAERO_API_KEY: ${SMSAERO_API_KEY:-}
-      SMSAERO_SIGN: ${SMSAERO_SIGN:-SMSAero}
+      OTP_PROVIDER: console
       ADMIN_PHONE: ${ADMIN_PHONE}
-      ADMIN_PHONES: ${ADMIN_PHONES:-}
-      CORS_ORIGINS: https://${DOMAIN}
+      ADMIN_PHONES: ${ADMIN_PHONES}
+      CORS_ORIGINS: https://${DEMO_DOMAIN}
+      EVENT_TIMEZONE: Asia/Vladivostok
       UPLOAD_DIR: /app/uploads
     volumes:
       - uploads:/app/uploads
@@ -39,14 +35,14 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
-      interval: 15s
+      interval: 20s
       timeout: 5s
       retries: 8
     networks:
       default:
-      proxy:
+      gateway:
         aliases:
-          - realdate-api
+          - realdate-demo-api
 
   web:
     build:
@@ -54,29 +50,29 @@ services:
       dockerfile: Dockerfile.prod
       args:
         VITE_API_URL: /api
-        VITE_PUBLIC_SITE_URL: https://${DOMAIN}
-        VITE_LEGAL_NAME: ${LEGAL_NAME:-}
-        VITE_LEGAL_INN: ${LEGAL_INN:-}
-        VITE_LEGAL_ADDRESS: ${LEGAL_ADDRESS:-}
-        VITE_SUPPORT_PHONE: ${SUPPORT_PHONE:-+79990800137}
-        VITE_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}
-        VITE_SUPPORT_TELEGRAM: ${SUPPORT_TELEGRAM:-katy_sha_00}
-        VITE_DOCUMENTS_EFFECTIVE_DATE: ${DOCUMENTS_EFFECTIVE_DATE:-}
+        VITE_PUBLIC_SITE_URL: https://${DEMO_DOMAIN}
+        VITE_LEGAL_NAME: ${LEGAL_NAME}
+        VITE_LEGAL_INN: ${LEGAL_INN}
+        VITE_LEGAL_ADDRESS: ${LEGAL_ADDRESS}
+        VITE_SUPPORT_PHONE: ${SUPPORT_PHONE}
+        VITE_SUPPORT_EMAIL: ${SUPPORT_EMAIL}
+        VITE_SUPPORT_TELEGRAM: ${SUPPORT_TELEGRAM}
+        VITE_DOCUMENTS_EFFECTIVE_DATE: ${DOCUMENTS_EFFECTIVE_DATE}
     restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
     networks:
       default:
-      proxy:
+      gateway:
         aliases:
-          - realdate-web
+          - realdate-demo-web
 
 volumes:
   postgres_data:
   uploads:
 
 networks:
-  proxy:
+  gateway:
     external: true
-    name: public-proxy
+    name: realdate_default

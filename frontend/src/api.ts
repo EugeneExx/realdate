@@ -71,6 +71,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  publicEvents: () => request<Event[]>("/public/events"),
   requestCode: (phone: string) =>
     request<{ sent: boolean; dev_code?: string }>("/auth/request-code", {
       method: "POST",
@@ -97,6 +98,8 @@ export const api = {
   register: (id: number) =>
     request<{
       registered: boolean;
+      waitlisted: boolean;
+      waitlist_position?: number;
       notification: { title: string; body: string };
     }>(`/events/${id}/register`, {
       method: "POST",
@@ -121,6 +124,11 @@ export const api = {
     request<{ unread: number }>("/notifications/unread-count"),
   readAllNotifications: () =>
     request<{ read: boolean }>("/notifications/read-all", { method: "POST" }),
+  telegramStatus: () => request<TelegramNotificationStatus>("/telegram/status"),
+  createTelegramLink: () =>
+    request<{ url: string; expires_in: number }>("/telegram/link", { method: "POST" }),
+  disconnectTelegram: () =>
+    request<{ disconnected: boolean }>("/telegram/link", { method: "DELETE" }),
   createEvent: (data: unknown) =>
     request<{ id: number }>("/admin/events", {
       method: "POST",
@@ -179,9 +187,10 @@ export type ProfileUpdate = {
 };
 export type Registration = {
   id: number;
-  status: "awaiting_payment" | "confirmed" | "rejected";
+  status: "awaiting_payment" | "confirmed" | "rejected" | "waitlisted";
   paid: boolean;
   participant_number?: number;
+  waitlist_position?: number;
 };
 export type QuizStatus = "draft" | "active" | "results";
 export type QuizQuestionType = "single" | "multiple" | "text";
@@ -211,6 +220,8 @@ export type Event = {
   age_max?: number;
   male_taken: number;
   female_taken: number;
+  place_available?: boolean;
+  waitlist_count: number;
   registration?: Registration;
   participants?: Person[];
   quiz?: QuizSummary;
@@ -221,6 +232,11 @@ export type Notice = {
   body: string;
   read: boolean;
   created_at: string;
+};
+export type TelegramNotificationStatus = {
+  configured: boolean;
+  connected: boolean;
+  bot_username?: string;
 };
 export type AdminRegistration = {
   id: number;
@@ -300,6 +316,7 @@ export type AdminEvent = Event & {
   stats: {
     registrations: number;
     confirmed: number;
+    waitlisted: number;
     revenue: number;
     likes: number;
     matches: number;

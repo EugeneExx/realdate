@@ -52,6 +52,8 @@ import {
   QuizSubmissionAnswer,
   User,
 } from "./api";
+import PublicSite, { PublicDocumentPage } from "./PublicSite";
+import { publicConfig } from "./public-config";
 
 const apiOrigin = (() => {
   const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
@@ -84,10 +86,29 @@ const latestAdultBirthDate = () => {
   value.setFullYear(value.getFullYear() - 18);
   return format(value, "yyyy-MM-dd");
 };
-const SUPPORT_PHONE = "+7 999 080-01-37";
-const SUPPORT_PHONE_LINK = "tel:+79990800137";
+const normalizeRussianPhoneDigits = (value: string) => {
+  let digits = value.replace(/\D/g, "");
+  if (digits.length > 10 && (digits.startsWith("7") || digits.startsWith("8"))) {
+    digits = digits.slice(1);
+  }
+  return digits.slice(0, 10);
+};
+const formatRussianPhoneDigits = (value: string) => {
+  const digits = normalizeRussianPhoneDigits(value);
+  const parts = [
+    digits.slice(0, 3),
+    digits.slice(3, 6),
+    digits.slice(6, 8),
+    digits.slice(8, 10),
+  ].filter(Boolean);
+  if (parts.length <= 1) return parts[0] || "";
+  if (parts.length === 2) return `${parts[0]} ${parts[1]}`;
+  return `${parts[0]} ${parts[1]}-${parts[2]}${parts[3] ? `-${parts[3]}` : ""}`;
+};
+const SUPPORT_PHONE = publicConfig.supportPhone;
+const SUPPORT_PHONE_LINK = `tel:+${SUPPORT_PHONE.replace(/\D/g, "")}`;
 const SUPPORT_TELEGRAM_LINK =
-  "tg://resolve?domain=katy_sha_00&text=Здравствуйте%21%20Нужна%20помощь%20по%20REALDATE";
+  `tg://resolve?domain=${publicConfig.supportTelegram}&text=Здравствуйте%21%20Нужна%20помощь%20по%20REALDATE`;
 const NOTIFICATIONS_CHANGED_EVENT = "realdate:notifications-changed";
 const notificationCountLabel = (count: number) => count > 9 ? "9+" : String(count);
 const telegramUsername = (value?: string) => {
@@ -138,7 +159,7 @@ function SupportContacts({ auth = false }: { auth?: boolean }) {
         <Send />
         <div>
           <b>Telegram</b>
-          <small>@katy_sha_00</small>
+          <small>@{publicConfig.supportTelegram}</small>
         </div>
       </a>
     </div>
@@ -155,7 +176,7 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    if (step === 1 && phone.replace(/\D/g, "").length !== 11) {
+    if (step === 1 && phone.length !== 10) {
       setError("Введите 10 цифр номера после +7");
       return;
     }
@@ -165,13 +186,14 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
     }
     setLoading(true);
     try {
+      const fullPhone = `+7${phone}`;
       if (step === 1) {
-        const data = await api.requestCode(phone);
+        const data = await api.requestCode(fullPhone);
         setStep(2);
         if (data.dev_code)
           setHint(`Код для локального запуска: ${data.dev_code}`);
       } else {
-        const data = await api.verify(phone, code);
+        const data = await api.verify(fullPhone, code);
         localStorage.setItem("realdate_token", data.access_token);
         onDone(data.user);
       }
@@ -213,6 +235,12 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
               ? "Введите номер — пришлём короткий код в Telegram."
               : "Мы отправили код на ваш номер. Обычно он приходит за несколько секунд."}
           </p>
+          {step === 2 && (
+            <div className="otp-phone">
+              <span>Код отправлен на</span>
+              <strong>+7 {formatRussianPhoneDigits(phone)}</strong>
+            </div>
+          )}
           {step === 1 ? (
             <label>
               Номер телефона
@@ -221,13 +249,10 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
                 <input
                   autoFocus
                   inputMode="tel"
+                  autoComplete="tel-national"
                   placeholder="999 123-45-67"
-                  value={phone.replace(/^\+7/, "")}
-                  onChange={(e) =>
-                    setPhone(
-                      "+7" + e.target.value.replace(/\D/g, "").slice(0, 10),
-                    )
-                  }
+                  value={formatRussianPhoneDigits(phone)}
+                  onChange={(e) => setPhone(normalizeRussianPhoneDigits(e.target.value))}
                 />
               </div>
             </label>
@@ -264,8 +289,8 @@ function Auth({ onDone }: { onDone: (user: User) => void }) {
             </button>
           )}
           <small className="legal">
-            Продолжая, вы принимаете условия сервиса и политику
-            конфиденциальности.
+            Продолжая, вы принимаете <NavLink to="/offer">условия сервиса</NavLink> и{" "}
+            <NavLink to="/privacy">политику конфиденциальности</NavLink>.
           </small>
           <SupportContacts auth />
         </form>
@@ -409,6 +434,11 @@ function Shell({
           />
           <Route path="/history" element={<History />} />
           <Route path="/notices" element={<Notices />} />
+          <Route path="/offer" element={<PublicDocumentPage kind="offer" />} />
+          <Route path="/privacy" element={<PublicDocumentPage kind="privacy" />} />
+          <Route path="/personal-data-consent" element={<PublicDocumentPage kind="consent" />} />
+          <Route path="/payment-and-refund" element={<PublicDocumentPage kind="payment" />} />
+          <Route path="/contacts" element={<PublicDocumentPage kind="contacts" />} />
           {user.is_admin && (
             <>
               <Route path="/admin" element={<Admin />} />
@@ -485,9 +515,11 @@ function EventsPage({ user }: { user: User }) {
 function EventCard({
   event,
   featured = false,
+  showRegistrationStatus = false,
 }: {
   event: Event;
   featured?: boolean;
+  showRegistrationStatus?: boolean;
 }) {
   const leftM = Math.max(0, event.male_capacity - event.male_taken),
     leftF = Math.max(0, event.female_capacity - event.female_taken);
@@ -540,11 +572,65 @@ function EventCard({
             Мужчины <b>{leftM} {plural(leftM, "место", "места", "мест")}</b>
           </span>
         </div>
+        {showRegistrationStatus && event.registration && (
+          <div className="my-event-statuses">
+            <div
+              className={`my-event-status ${
+                event.registration.status === "waitlisted"
+                  ? "status-waitlisted"
+                  : event.registration.paid
+                    ? "status-confirmed"
+                    : "status-pending"
+              }`}
+            >
+              <WalletCards />
+              <span>
+                <small>Оплата</small>
+                <b>
+                  {event.registration.status === "waitlisted"
+                    ? "После выхода из очереди"
+                    : event.registration.paid
+                      ? "Оплачено"
+                      : "Не оплачено"}
+                </b>
+              </span>
+            </div>
+            <div
+              className={`my-event-status status-${event.registration.status}`}
+            >
+              {event.registration.status === "confirmed" ? (
+                <Check />
+              ) : event.registration.status === "rejected" ? (
+                <X />
+              ) : event.registration.status === "waitlisted" ? (
+                <Users />
+              ) : (
+                <Clock3 />
+              )}
+              <span>
+                <small>Запись на встречу</small>
+                <b>
+                  {event.registration.status === "confirmed"
+                    ? "Подтверждена"
+                    : event.registration.status === "rejected"
+                      ? "Отклонена"
+                      : event.registration.status === "waitlisted"
+                        ? `В листе ожидания${event.registration.waitlist_position ? ` · № ${event.registration.waitlist_position}` : ""}`
+                      : "На проверке"}
+                </b>
+              </span>
+            </div>
+          </div>
+        )}
         <div className="card-foot">
           <strong>{money(event.price)}</strong>
           <div className="card-actions">
             <NavLink to={`/events/${event.id}`} className="card-detail-link">
-              {event.registration ? "Вы записаны →" : "Подробнее →"}
+              {event.registration?.status === "waitlisted"
+                ? "Вы в очереди →"
+                : event.registration
+                  ? "Вы записаны →"
+                  : "Подробнее →"}
             </NavLink>
             {event.quiz && (
               <NavLink to={`/events/${event.id}/quiz`} className="quiz-card-button">
@@ -570,6 +656,7 @@ function EventPage() {
   const [successNotice, setSuccessNotice] = useState<{ title: string; body: string } | null>(null);
   const [agree, setAgree] = useState([false, false]);
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const load = () => api.event(Number(id)).then(setEvent);
   useEffect(() => {
     void load();
@@ -577,9 +664,11 @@ function EventPage() {
   if (!event) return <Loader />;
   const leftM = Math.max(0, event.male_capacity - event.male_taken);
   const leftF = Math.max(0, event.female_capacity - event.female_taken);
+  const joiningWaitlist = !event.registration && event.place_available === false;
   async function register() {
     try {
       setError("");
+      setSubmitting(true);
       const result = await api.register(event!.id);
       setModal(false);
       setAgree([false, false]);
@@ -588,6 +677,8 @@ function EventPage() {
       void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка");
+    } finally {
+      setSubmitting(false);
     }
   }
   return (
@@ -673,23 +764,44 @@ function EventPage() {
           )}
           {event.registration ? (
             <div className={`status-box ${event.registration.status}`}>
-              <Check />
+              {event.registration.status === "confirmed" ? (
+                <Check />
+              ) : event.registration.status === "rejected" ? (
+                <X />
+              ) : event.registration.status === "waitlisted" ? (
+                <Users />
+              ) : (
+                <Clock3 />
+              )}
               <div>
                 <b>
                   {event.registration.status === "confirmed"
                     ? "Запись подтверждена"
-                    : "Ждём предоплату"}
+                    : event.registration.status === "rejected"
+                      ? "Запись отклонена"
+                      : event.registration.status === "waitlisted"
+                        ? "Вы в листе ожидания"
+                      : "Запись на проверке"}
                 </b>
                 <small>
                   {event.registration.paid
                     ? "Оплата отмечена"
-                    : "Администратор свяжется с вами"}
+                    : event.registration.status === "rejected"
+                      ? "Свяжитесь с поддержкой, если остались вопросы"
+                      : event.registration.status === "waitlisted"
+                        ? `Мы уведомим об освободившемся месте${event.registration.waitlist_position ? ` · ваша позиция № ${event.registration.waitlist_position}` : ""}`
+                      : "Администратор свяжется с вами"}
                 </small>
               </div>
             </div>
           ) : (
             <button className="primary wide" onClick={() => setModal(true)}>
-              Записаться на встречу
+              {joiningWaitlist ? "Встать в лист ожидания" : "Записаться на встречу"}
+            </button>
+          )}
+          {event.registration?.status === "waitlisted" && event.place_available && (
+            <button className="primary wide waitlist-claim-button" disabled={submitting} onClick={register}>
+              {submitting ? "Отправляем…" : "Подать заявку на свободное место"}
             </button>
           )}
           {event.quiz && (
@@ -721,8 +833,12 @@ function EventPage() {
               <X />
             </button>
             <span className="eyebrow">Последний шаг</span>
-            <h2>Подтвердите запись</h2>
-            <p>После заявки администратор свяжется с вами для предоплаты.</p>
+            <h2>{joiningWaitlist ? "Встать в лист ожидания" : "Подтвердите запись"}</h2>
+            <p>
+              {joiningWaitlist
+                ? "Сейчас мест для вашей категории нет. Мы уведомим вас, когда место освободится."
+                : "После заявки администратор свяжется с вами для предоплаты."}
+            </p>
             <label className="check">
               <input
                 type="checkbox"
@@ -730,10 +846,15 @@ function EventPage() {
                 onChange={(e) => setAgree([e.target.checked, agree[1]])}
               />
               <span>
-                Я согласен(на) на обработку персональных данных согласно{" "}
+                Я принимаю{" "}
+                <NavLink to="/personal-data-consent" target="_blank">
+                  согласие на обработку персональных данных
+                </NavLink>{" "}
+                согласно{" "}
                 <a
                   href="https://www.consultant.ru/document/cons_doc_LAW_61801/"
                   target="_blank"
+                  rel="noreferrer"
                 >
                   ФЗ №152-ФЗ
                 </a>
@@ -747,15 +868,24 @@ function EventPage() {
               />
               <span>
                 Я согласен(на) внести полную предоплату {money(event.price)}
+                {joiningWaitlist ? ", если место освободится" : ""}
+                {" "}и принимаю{" "}
+                <NavLink to="/payment-and-refund" target="_blank">
+                  правила оплаты и возврата
+                </NavLink>
               </span>
             </label>
             {error && <div className="error">{error}</div>}
             <button
               className="primary wide"
-              disabled={!agree.every(Boolean)}
+              disabled={!agree.every(Boolean) || submitting}
               onClick={register}
             >
-              Отправить заявку
+              {submitting
+                ? "Отправляем…"
+                : joiningWaitlist
+                  ? "Встать в очередь"
+                  : "Отправить заявку"}
             </button>
           </div>
         </div>
@@ -773,7 +903,7 @@ function EventPage() {
             <div className="registration-success-icon">
               <CircleCheckBig />
             </div>
-            <span className="eyebrow">Заявка принята</span>
+            <span className="eyebrow">Готово</span>
             <h2>{successNotice.title}</h2>
             <p>{successNotice.body}</p>
             <div className="registration-notice-hint">
@@ -1273,7 +1403,6 @@ function MyEvents() {
           .filter(
             (event) =>
               event.registration &&
-              event.registration.status !== "rejected" &&
               event.status !== "finished" &&
               event.status !== "cancelled",
           )
@@ -1295,7 +1424,12 @@ function MyEvents() {
       <div className="event-grid">
         {events.length ? (
           events.map((event, index) => (
-            <EventCard event={event} featured={index === 0} key={event.id} />
+            <EventCard
+              event={event}
+              featured={index === 0}
+              showRegistrationStatus
+              key={event.id}
+            />
           ))
         ) : (
           <Empty text="Активных записей пока нет" />
@@ -1362,6 +1496,17 @@ function Notices() {
   const [items, setItems] = useState<
     Awaited<ReturnType<typeof api.notifications>>
   >([]);
+  const [telegramStatus, setTelegramStatus] = useState<
+    Awaited<ReturnType<typeof api.telegramStatus>> | null
+  >(null);
+  const [telegramPending, setTelegramPending] = useState(false);
+  const [telegramBusy, setTelegramBusy] = useState(false);
+  const [telegramError, setTelegramError] = useState("");
+  const refreshTelegramStatus = () =>
+    api.telegramStatus().then((status) => {
+      setTelegramStatus(status);
+      if (status.connected) setTelegramPending(false);
+    });
   useEffect(() => {
     let active = true;
     api.notifications().then((notices) => {
@@ -1377,9 +1522,82 @@ function Notices() {
       active = false;
     };
   }, []);
+  useEffect(() => {
+    void refreshTelegramStatus();
+    const refresh = () => void refreshTelegramStatus();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+  useEffect(() => {
+    if (!telegramPending) return;
+    const interval = window.setInterval(() => void refreshTelegramStatus(), 2500);
+    return () => window.clearInterval(interval);
+  }, [telegramPending]);
+  async function connectTelegram() {
+    setTelegramError("");
+    setTelegramBusy(true);
+    const popup = window.open("", "_blank");
+    try {
+      const result = await api.createTelegramLink();
+      if (popup) {
+        popup.opener = null;
+        popup.location.href = result.url;
+      } else {
+        window.location.href = result.url;
+      }
+      setTelegramPending(true);
+    } catch (e) {
+      popup?.close();
+      setTelegramError(e instanceof Error ? e.message : "Не удалось открыть Telegram");
+    } finally {
+      setTelegramBusy(false);
+    }
+  }
+  async function disconnectTelegram() {
+    setTelegramError("");
+    setTelegramBusy(true);
+    try {
+      await api.disconnectTelegram();
+      await refreshTelegramStatus();
+    } catch (e) {
+      setTelegramError(e instanceof Error ? e.message : "Не удалось отключить Telegram");
+    } finally {
+      setTelegramBusy(false);
+    }
+  }
   return (
     <div className="page narrow">
       <PageHead eyebrow="Будьте в курсе" title="Уведомления" />
+      <section className={`telegram-notification-card ${telegramStatus?.connected ? "connected" : ""}`}>
+        <div className="telegram-notification-icon">
+          {telegramStatus?.connected ? <Check /> : <Send />}
+        </div>
+        <div className="telegram-notification-copy">
+          <h3>{telegramStatus?.connected ? "Telegram подключён" : "Уведомления в Telegram"}</h3>
+          <p>
+            {telegramStatus?.connected
+              ? `Бот @${telegramStatus.bot_username} будет присылать важные сообщения о мероприятиях.`
+              : telegramPending
+                ? "Откройте Telegram и нажмите Start. Статус обновится автоматически."
+                : "Получайте подтверждения записи, напоминания и результаты прямо в Telegram."}
+          </p>
+          {telegramError && <small className="telegram-notification-error">{telegramError}</small>}
+        </div>
+        {telegramStatus?.connected ? (
+          <button type="button" className="secondary" disabled={telegramBusy} onClick={disconnectTelegram}>
+            Отключить
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="primary"
+            disabled={telegramBusy || telegramPending || telegramStatus?.configured === false}
+            onClick={connectTelegram}
+          >
+            {telegramPending ? "Ждём Start…" : telegramBusy ? "Открываем…" : "Подключить Telegram"}
+          </button>
+        )}
+      </section>
       <div className="notice-list">
         {items.length ? (
           items.map((n) => (
@@ -2263,6 +2481,12 @@ function AdminEventPage() {
           </span>
         </div>
         <div>
+          <Clock3 />
+          <span>
+            В листе ожидания<b>{event.stats.waitlisted}</b>
+          </span>
+        </div>
+        <div>
           <WalletCards />
           <span>
             Выручка<b>{money(event.stats.revenue)}</b>
@@ -2341,31 +2565,50 @@ function AdminEventPage() {
                     : "Возраст не указан"}
                 </small>
               </span>
-              <label className="switch-label">
-                <input
-                  type="checkbox"
-                  checked={r.paid}
-                  onChange={(e) => moderate(r.id, "paid", e.target.checked)}
-                />
-                <i />
-                {r.paid ? "Внесена" : "Ожидается"}
-              </label>
-              <div className="row-actions">
-                <button
-                  className={r.status === "confirmed" ? "active" : ""}
-                  onClick={() => moderate(r.id, "confirmed", true)}
-                >
-                  <Check />
-                  Подтвердить
-                </button>
-                <button
-                  className={r.status === "rejected" ? "danger" : ""}
-                  aria-label={`Отклонить заявку ${r.user.name || "участника"}`}
-                  onClick={() => moderate(r.id, "confirmed", false)}
-                >
-                  <X />
-                </button>
-              </div>
+              {r.status === "waitlisted" ? (
+                <span className="waitlist-payment">После освобождения места</span>
+              ) : (
+                <label className="switch-label">
+                  <input
+                    type="checkbox"
+                    checked={r.paid}
+                    onChange={(e) => moderate(r.id, "paid", e.target.checked)}
+                  />
+                  <i />
+                  {r.paid ? "Внесена" : "Ожидается"}
+                </label>
+              )}
+              {r.status === "waitlisted" ? (
+                <div className="row-actions waitlist-admin-actions">
+                  <span className="waitlist-admin-status">
+                    <Clock3 />
+                    В очереди
+                  </span>
+                  <button
+                    aria-label={`Удалить ${r.user.name || "участника"} из листа ожидания`}
+                    onClick={() => moderate(r.id, "confirmed", false)}
+                  >
+                    <X />
+                  </button>
+                </div>
+              ) : (
+                <div className="row-actions">
+                  <button
+                    className={r.status === "confirmed" ? "active" : ""}
+                    onClick={() => moderate(r.id, "confirmed", true)}
+                  >
+                    <Check />
+                    Подтвердить
+                  </button>
+                  <button
+                    className={r.status === "rejected" ? "danger" : ""}
+                    aria-label={`Отклонить заявку ${r.user.name || "участника"}`}
+                    onClick={() => moderate(r.id, "confirmed", false)}
+                  >
+                    <X />
+                  </button>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -2461,7 +2704,11 @@ function Loader() {
 }
 
 export default function App() {
+  const location = useLocation();
   const [user, setUser] = useState<User | null | undefined>(undefined);
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [location.pathname]);
   useEffect(() => {
     if (localStorage.getItem("realdate_token"))
       api
@@ -2474,9 +2721,12 @@ export default function App() {
     else setUser(null);
   }, []);
   if (user === undefined) return <Loader />;
+  if (!user && location.pathname === "/login") {
+    return <Auth onDone={setUser} />;
+  }
   return user ? (
     <Shell user={user} setUser={setUser} />
   ) : (
-    <Auth onDone={setUser} />
+    <PublicSite />
   );
 }

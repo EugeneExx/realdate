@@ -23,6 +23,9 @@ services:
       OTP_PROVIDER: ${OTP_PROVIDER}
       TELEGRAM_GATEWAY_TOKEN: ${TELEGRAM_GATEWAY_TOKEN:-}
       TELEGRAM_SENDER_USERNAME: ${TELEGRAM_SENDER_USERNAME:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+      TELEGRAM_BOT_WEBHOOK_SECRET: ${TELEGRAM_BOT_WEBHOOK_SECRET:-}
       SMSRU_API_ID: ${SMSRU_API_ID:-}
       SMSRU_FROM: ${SMSRU_FROM:-}
       SMSAERO_EMAIL: ${SMSAERO_EMAIL:-}
@@ -31,6 +34,7 @@ services:
       ADMIN_PHONE: ${ADMIN_PHONE}
       ADMIN_PHONES: ${ADMIN_PHONES:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://${DOMAIN}}
+      EVENT_TIMEZONE: ${EVENT_TIMEZONE:-Asia/Vladivostok}
       UPLOAD_DIR: /app/uploads
     volumes:
       - uploads:/app/uploads
@@ -49,6 +53,14 @@ services:
       dockerfile: Dockerfile.prod
       args:
         VITE_API_URL: /api
+        VITE_PUBLIC_SITE_URL: https://${DOMAIN}
+        VITE_LEGAL_NAME: ${LEGAL_NAME:-}
+        VITE_LEGAL_INN: ${LEGAL_INN:-}
+        VITE_LEGAL_ADDRESS: ${LEGAL_ADDRESS:-}
+        VITE_SUPPORT_PHONE: ${SUPPORT_PHONE:-+79990800137}
+        VITE_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}
+        VITE_SUPPORT_TELEGRAM: ${SUPPORT_TELEGRAM:-katy_sha_00}
+        VITE_DOCUMENTS_EFFECTIVE_DATE: ${DOCUMENTS_EFFECTIVE_DATE:-}
     restart: unless-stopped
     depends_on:
       api:
