@@ -543,7 +543,7 @@ function Shell({
       label: "Управление",
     });
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${mobile ? "menu-open" : ""}`}>
       <aside className={`sidebar ${mobile ? "open" : ""}`}>
         <div className="side-top">
           <Logo />

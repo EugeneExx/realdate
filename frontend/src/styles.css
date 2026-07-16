@@ -5382,10 +5382,24 @@ select:focus {
     transform: translateX(-102%);
     transition: 0.25s;
     width: min(82vw, 300px);
+    max-height: 100dvh;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: max(32px, env(safe-area-inset-bottom));
     box-shadow: var(--shadow);
   }
   .sidebar.open {
     transform: none;
+  }
+  .sidebar .support-card {
+    flex: 0 0 auto;
+  }
+  .app-shell.menu-open .bottom-nav {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
   }
   .close-menu {
     display: grid;
